@@ -671,38 +671,49 @@ function setup(ctx) {
   const unbindToggleInjectionAction = toggleInjectionAction?.onClick(() => {
     sendBackend({ type: "toggle_injection" });
   });
-  let toolbarAction = null;
-  let unbindToolbarAction = null;
-  const renderToolbarAction = () => {
-    if (toolbarAction) {
-      unbindToolbarAction?.();
-      toolbarAction.destroy?.();
-      toolbarAction = null;
-      unbindToolbarAction = null;
+  let domToolbarActionElement = null;
+  let domToolbarActionObserver = null;
+  const injectToolbarAction = () => {
+    if (domToolbarActionElement && document.body.contains(domToolbarActionElement)) return;
+    const sendButton = document.querySelector('button[aria-label*="Send" i], button[title*="Send" i], button[type="submit"], [data-testid*="send" i], button svg path[d*="M2"]')?.closest("button");
+    if (sendButton && sendButton.parentElement) {
+      const btn = document.createElement("button");
+      btn.className = "tracktor-dom-toolbar-btn";
+      btn.type = "button";
+      btn.addEventListener("click", (event) => {
+        const action = btn.getAttribute("data-action");
+        if (action === "generate_tracker") {
+          sendBackend({ type: "generate_tracker" });
+          placement.activate();
+        } else if (action === "cancel_job") {
+          sendBackend({ type: "cancel_job", jobId: btn.getAttribute("data-job-id") ?? void 0 });
+        }
+      });
+      sendButton.parentElement.insertBefore(btn, sendButton);
+      domToolbarActionElement = btn;
     }
-    const activeJob = state?.jobs?.find((j) => j.status === "running" && j.chatId === state?.activeChat?.id);
-    if (activeJob) {
-      const progress = activeJob.totalParts ? ` (${activeJob.currentPart}/${activeJob.totalParts})` : "";
-      toolbarAction = ctxRef.ui?.registerInputBarAction?.({
-        id: "tracktor-generate-action",
-        label: `Stop ${activeJob.label}${progress}`,
-        enabled: true,
-        iconSvg: ICON_STOP
-      });
-      unbindToolbarAction = toolbarAction?.onClick(() => {
-        sendBackend({ type: "cancel_job", jobId: activeJob.id });
-      });
-    } else {
-      toolbarAction = ctxRef.ui?.registerInputBarAction?.({
-        id: "tracktor-generate-action",
-        label: "Generate Latest Tracker",
-        enabled: true,
-        iconSvg: TRACKTOR_SMALL_ICON
-      });
-      unbindToolbarAction = toolbarAction?.onClick(() => {
-        sendBackend({ type: "generate_tracker" });
-        placement.activate();
-      });
+  };
+  const renderDomToolbarAction = () => {
+    if (!domToolbarActionObserver) {
+      domToolbarActionObserver = new MutationObserver(() => injectToolbarAction());
+      domToolbarActionObserver.observe(document.body, { childList: true, subtree: true });
+    }
+    injectToolbarAction();
+    if (domToolbarActionElement) {
+      const activeJob = state?.jobs?.find((j) => j.status === "running" && j.chatId === state?.activeChat?.id);
+      if (activeJob) {
+        domToolbarActionElement.classList.add("tracktor-dom-busy");
+        domToolbarActionElement.setAttribute("data-action", "cancel_job");
+        domToolbarActionElement.setAttribute("data-job-id", activeJob.id);
+        domToolbarActionElement.innerHTML = ICON_STOP;
+        domToolbarActionElement.title = `Stop ${activeJob.label}`;
+      } else {
+        domToolbarActionElement.classList.remove("tracktor-dom-busy");
+        domToolbarActionElement.setAttribute("data-action", "generate_tracker");
+        domToolbarActionElement.removeAttribute("data-job-id");
+        domToolbarActionElement.innerHTML = TRACKTOR_SMALL_ICON;
+        domToolbarActionElement.title = "Generate Latest Tracker";
+      }
     }
   };
   const unbindBackend = ctx.onBackendMessage((payload) => {
@@ -713,7 +724,7 @@ function setup(ctx) {
       render();
       renderMessageWidgets();
       renderPinnedHud();
-      renderToolbarAction();
+      renderDomToolbarAction();
     } else if (payload?.type === "diagnostic") {
       if (!state) return;
       state.diagnostics = [String(payload.message ?? "Diagnostic"), ...state.diagnostics ?? []].slice(0, 12);
@@ -758,8 +769,8 @@ function setup(ctx) {
     widgetCleanups.clear();
     cleanupPinnedHud();
     cleanupWidgetTopObserver();
-    unbindToolbarAction?.();
-    toolbarAction?.destroy?.();
+    if (domToolbarActionObserver) domToolbarActionObserver.disconnect();
+    if (domToolbarActionElement) domToolbarActionElement.remove();
     unbindOpenAction?.();
     openAction?.destroy();
     unbindToggleInjectionAction?.();
@@ -1833,8 +1844,8 @@ function buildWidgetHtml(item) {
       button { border: 1px solid var(--lumiverse-border, #444); background: var(--lumiverse-fill, #111); color: inherit; border-radius: 7px; cursor: pointer; }
       button:hover, button:focus-visible { border-color: var(--lumiverse-border-hover, #777); outline: none; }
       .actions { display: flex; gap: 5px; flex-wrap: nowrap; align-items: center; }
-      .icon-button { width: 30px; height: 30px; padding: 0; display: inline-grid; place-items: center; flex: 0 0 auto; }
-      .icon-button svg { width: 15px; height: 15px; display: block; }
+      .icon-button { width: 22px; height: 22px; padding: 0; display: inline-grid; place-items: center; flex: 0 0 auto; border-radius: 4px; }
+      .icon-button svg { width: 12px; height: 12px; display: block; }
       table { width: 100%; border-collapse: collapse; }
       td { border-top: 1px solid var(--lumiverse-border, #444); padding: 4px 6px; vertical-align: top; }
       details { margin-top: 8px; }
@@ -1993,15 +2004,15 @@ var STYLES = `
   .tracktor-primary-actions { margin-top: 8px; }
   .tracktor-icon-actions { flex-wrap: nowrap; }
   .tracktor-icon-button {
-    width: 30px;
-    height: 30px;
+    width: 22px;
+    height: 22px;
     padding: 0 !important;
     display: inline-grid;
     place-items: center;
     flex: 0 0 auto;
-    border-radius: 7px !important;
+    border-radius: 4px !important;
   }
-  .tracktor-icon-button svg { width: 15px; height: 15px; display: block; }
+  .tracktor-icon-button svg { width: 12px; height: 12px; display: block; }
   .tracktor-icon-button:focus-visible { outline: 2px solid var(--lumiverse-accent); outline-offset: 2px; }
   .tracktor-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   .tracktor-common-controls { align-items: end; }
@@ -2123,6 +2134,38 @@ var STYLES = `
     padding-top: 0 !important;
     padding-bottom: 0 !important;
     overflow: hidden;
+  }
+  .tracktor-dom-toolbar-btn {
+    background: transparent;
+    border: none;
+    color: var(--lumiverse-text-muted, #aaa);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    padding: 0;
+    margin: 0 4px;
+    transition: all 0.2s ease;
+  }
+  .tracktor-dom-toolbar-btn:hover {
+    background: var(--lumiverse-fill-subtle, rgba(255,255,255,0.1));
+    color: var(--lumiverse-text, #fff);
+  }
+  .tracktor-dom-toolbar-btn.tracktor-dom-busy {
+    color: #e46c6c;
+    animation: tracktor-pulse 1.5s infinite;
+  }
+  .tracktor-dom-toolbar-btn svg {
+    width: 20px;
+    height: 20px;
+  }
+  @keyframes tracktor-pulse {
+    0% { transform: scale(1); }
+    50% { transform: scale(1.15); }
+    100% { transform: scale(1); }
   }
   @media (max-width: 680px) {
     .tracktor-toolbar, .tracktor-item-head { flex-direction: column; align-items: stretch; }
