@@ -1,4 +1,4 @@
-import Handlebars from 'handlebars';
+// Built-in template engine — no external dependencies.
 
 export const EXTENSION_ID = 'tracktor';
 export const METADATA_KEY = 'tracktor';
@@ -14,6 +14,7 @@ export type TrackerConversationRoleMode = 'preserve' | 'all_assistant' | 'plain_
 export type TrackerWorldBookMode = 'include_all' | 'exclude_all' | 'allowlist';
 export type SnapshotTransformPresetKey = 'default_json' | 'minimal' | 'toon' | 'custom';
 export type TemplateEngine = 'handlebars' | 'simple';
+export type TrackerPlacement = 'message_bottom' | 'message_top' | 'chat_top_pinned';
 
 export interface LlmMessageDTO {
   role: MessageRole;
@@ -168,6 +169,7 @@ export interface TracktorSettings {
   allowedWorldBookEntryIds: string[];
   debugLogging: boolean;
   templateEngine: TemplateEngine;
+  trackerPlacement: TrackerPlacement;
 }
 
 export interface ChatTracktorConfig {
@@ -417,6 +419,7 @@ export const defaultSettings: TracktorSettings = {
   allowedWorldBookEntryIds: [],
   debugLogging: false,
   templateEngine: 'handlebars',
+  trackerPlacement: 'message_bottom',
 };
 
 export function deepMergeSettings(input: unknown, schemaPresets?: Record<string, SchemaPreset>): TracktorSettings {
@@ -465,6 +468,7 @@ export function deepMergeSettings(input: unknown, schemaPresets?: Record<string,
   merged.generationMode = merged.structuredOutputMode === 'native_json_schema' ? 'native_json' : 'json';
   merged.trackerConversationRoleMode = normalizeEnum(saved.trackerConversationRoleMode, ['preserve', 'all_assistant', 'plain_transcript'], 'preserve');
   merged.templateEngine = normalizeTemplateEngine(saved.templateEngine);
+  merged.trackerPlacement = normalizeEnum(saved.trackerPlacement, ['message_bottom', 'message_top', 'chat_top_pinned'], 'message_bottom');
   merged.snapshotRole = normalizeEnum(saved.snapshotRole, ['system', 'user', 'assistant'], 'system');
   merged.trackerWorldBookMode = normalizeEnum(saved.trackerWorldBookMode, ['include_all', 'exclude_all', 'allowlist'], 'include_all');
   merged.snapshotTransformPresetKey = normalizeEnum(saved.snapshotTransformPresetKey, ['default_json', 'minimal', 'toon', 'custom'], 'default_json');
@@ -681,18 +685,12 @@ export function renderTrackerTemplate(
   data: unknown,
   options: { templateEngine?: TemplateEngine; onWarning?: (message: string) => void } = {},
 ): string {
-  const engine = options.templateEngine ?? 'handlebars';
   const sanitizedTemplate = stripDangerousHtml(templateHtml);
   try {
-    const rendered = engine === 'simple'
-      ? renderScopedTemplate(sanitizedTemplate, data, data)
-      : renderHandlebarsTemplate(sanitizedTemplate, data);
+    const rendered = renderBuiltinTemplate(sanitizedTemplate, data, data);
     return stripDangerousHtml(rendered);
   } catch (error) {
-    if (engine !== 'simple' && error instanceof Error && error.message === 'Handlebars renderer is unavailable.') {
-      options.onWarning?.(`Handlebars template renderer failed; falling back to simple renderer: ${error instanceof Error ? error.message : String(error)}`);
-      return stripDangerousHtml(renderScopedTemplate(sanitizedTemplate, data, data));
-    }
+    options.onWarning?.(`Template rendering failed: ${error instanceof Error ? error.message : String(error)}`);
     throw error;
   }
 }
@@ -921,58 +919,200 @@ function sanitizeInteger(value: unknown, fallback: number, min: number, max: num
   return Math.min(max, Math.max(min, Math.floor(parsed)));
 }
 
-const handlebarsRuntime = (() => {
-  try {
-    const runtime = Handlebars.create();
-    runtime.registerHelper('join', (value: unknown, separator: unknown) => {
-      if (!Array.isArray(value)) return '';
-      const delimiter = typeof separator === 'string' ? separator : ', ';
-      return value.map((item) => typeof item === 'object' ? JSON.stringify(item) : String(item ?? '')).join(delimiter);
-    });
-    runtime.registerHelper('json', (value: unknown) => JSON.stringify(value, null, 2));
-    return runtime;
-  } catch {
-    return null;
-  }
-})();
-
-function renderHandlebarsTemplate(template: string, data: unknown): string {
-  if (!handlebarsRuntime) {
-    throw new Error('Handlebars renderer is unavailable.');
-  }
-  const compiled = handlebarsRuntime.compile(template, {
-    noEscape: false,
-    strict: false,
-  });
-  return compiled({ data }, {
-    allowProtoMethodsByDefault: false,
-    allowProtoPropertiesByDefault: false,
-  });
+/**
+ * Built-in safe template engine that handles the Handlebars subset used by
+ * zTracker / WTracker templates without any external dependency.
+ *
+ * Supported syntax:
+ *   {{data.x}}                    — escaped variable interpolation
+ *   {{{data.x}}}                  — raw interpolation (still sanitized after render)
+ *   {{#if data.x}}...{{/if}}      — conditional block
+ *   {{#if data.x}}...{{else}}...{{/if}}
+ *   {{#unless data.x}}...{{/unless}}
+ *   {{#each data.arr}}...{{/each}} — iteration (supports nesting)
+ *   {{this}}  / {{this.field}}     — current iteration item
+ *   {{join data.arr ', '}}         — join array helper
+ *   {{json data.x}}                — JSON pretty-print helper
+ */
+function renderBuiltinTemplate(template: string, scope: unknown, rootData: unknown): string {
+  return processTemplate(template, scope, rootData, 0);
 }
 
-function renderScopedTemplate(template: string, scope: unknown, rootData: unknown): string {
-  let rendered = template.replace(/{{#each\s+([^}]+)}}([\s\S]*?){{\/each}}/g, (_match, path: string, body: string) => {
-    const items = resolveTemplatePath(path.trim(), scope, rootData);
-    if (!Array.isArray(items)) return '';
-    return items.map((item) => renderScopedTemplate(body, item, rootData)).join('');
-  });
+const MAX_TEMPLATE_DEPTH = 32;
 
-  rendered = rendered.replace(/{{\s*join\s+([^\s}]+)\s+(['"])(.*?)\2\s*}}/g, (_match, path: string, _quote: string, separator: string) => {
-    const value = resolveTemplatePath(path.trim(), scope, rootData);
-    if (!Array.isArray(value)) return '';
-    return escapeHtml(value.map((item) => typeof item === 'object' ? JSON.stringify(item) : String(item)).join(separator));
-  });
+function processTemplate(template: string, scope: unknown, rootData: unknown, depth: number): string {
+  if (depth > MAX_TEMPLATE_DEPTH) return '<!-- template depth exceeded -->';
 
-  rendered = rendered.replace(/{{\s*json\s+([^}]+)\s*}}/g, (_match, path: string) => {
-    const value = resolveTemplatePath(path.trim(), scope, rootData);
-    return escapeHtml(JSON.stringify(value, null, 2));
-  });
+  let result = '';
+  let pos = 0;
 
-  rendered = rendered.replace(/{{\s*([a-zA-Z0-9_.-]+|this)\s*}}/g, (_match, path: string) => {
-    return escapeHtml(resolveTemplatePath(path.trim(), scope, rootData));
-  });
+  while (pos < template.length) {
+    // Find the next tag
+    const tagStart = template.indexOf('{{', pos);
+    if (tagStart === -1) {
+      result += template.slice(pos);
+      break;
+    }
 
-  return rendered;
+    // Output text before the tag
+    result += template.slice(pos, tagStart);
+
+    // Check for triple-stache {{{raw}}}
+    if (template[tagStart + 2] === '{') {
+      const tripleEnd = template.indexOf('}}}', tagStart + 3);
+      if (tripleEnd === -1) {
+        result += '{{{';
+        pos = tagStart + 3;
+        continue;
+      }
+      const inner = template.slice(tagStart + 3, tripleEnd).trim();
+      const value = resolveTemplatePath(inner, scope, rootData);
+      result += String(value ?? '');
+      pos = tripleEnd + 3;
+      continue;
+    }
+
+    const tagEnd = template.indexOf('}}', tagStart + 2);
+    if (tagEnd === -1) {
+      result += template.slice(tagStart);
+      break;
+    }
+
+    const tagContent = template.slice(tagStart + 2, tagEnd).trim();
+    pos = tagEnd + 2;
+
+    // Block helpers: {{#each}}, {{#if}}, {{#unless}}
+    const blockMatch = tagContent.match(/^#(each|if|unless)\s+(.+)$/);
+    if (blockMatch) {
+      const [, blockType, blockPath] = blockMatch;
+      const { body, elseBody, endPos } = findBlockEnd(template, pos, blockType);
+      pos = endPos;
+
+      if (blockType === 'each') {
+        const items = resolveTemplatePath(blockPath.trim(), scope, rootData);
+        if (Array.isArray(items)) {
+          result += items.map((item) => processTemplate(body, item, rootData, depth + 1)).join('');
+        } else if (elseBody !== undefined) {
+          result += processTemplate(elseBody, scope, rootData, depth + 1);
+        }
+      } else if (blockType === 'if') {
+        const value = resolveTemplatePath(blockPath.trim(), scope, rootData);
+        if (isTruthy(value)) {
+          result += processTemplate(body, scope, rootData, depth + 1);
+        } else if (elseBody !== undefined) {
+          result += processTemplate(elseBody, scope, rootData, depth + 1);
+        }
+      } else if (blockType === 'unless') {
+        const value = resolveTemplatePath(blockPath.trim(), scope, rootData);
+        if (!isTruthy(value)) {
+          result += processTemplate(body, scope, rootData, depth + 1);
+        } else if (elseBody !== undefined) {
+          result += processTemplate(elseBody, scope, rootData, depth + 1);
+        }
+      }
+      continue;
+    }
+
+    // {{join path 'sep'}} helper
+    const joinMatch = tagContent.match(/^join\s+(\S+)\s+(['"])(.*?)\2$/);
+    if (joinMatch) {
+      const value = resolveTemplatePath(joinMatch[1].trim(), scope, rootData);
+      if (Array.isArray(value)) {
+        result += escapeHtml(value.map((item) => typeof item === 'object' ? JSON.stringify(item) : String(item)).join(joinMatch[3]));
+      }
+      continue;
+    }
+
+    // {{json path}} helper
+    const jsonMatch = tagContent.match(/^json\s+(.+)$/);
+    if (jsonMatch) {
+      const value = resolveTemplatePath(jsonMatch[1].trim(), scope, rootData);
+      result += escapeHtml(JSON.stringify(value, null, 2));
+      continue;
+    }
+
+    // {{variable}} — escaped interpolation
+    if (/^[a-zA-Z0-9_.@-]+$/.test(tagContent) || tagContent === 'this') {
+      result += escapeHtml(resolveTemplatePath(tagContent, scope, rootData));
+      continue;
+    }
+
+    // Unknown tag — output as-is
+    result += `{{${tagContent}}}`;
+  }
+
+  return result;
+}
+
+/**
+ * Finds the matching {{/blockType}} for an opening block tag, correctly
+ * handling nested blocks of the same type. Returns the body, optional else
+ * body, and the position after the closing tag.
+ */
+function findBlockEnd(
+  template: string,
+  startPos: number,
+  blockType: string,
+): { body: string; elseBody: string | undefined; endPos: number } {
+  const openTag = `{{#${blockType}`;
+  const closeTag = `{{/${blockType}}}`;
+  const elseTag = '{{else}}';
+  let depth = 1;
+  let pos = startPos;
+  let elsePos: number | undefined;
+
+  while (pos < template.length && depth > 0) {
+    const nextOpen = template.indexOf(openTag, pos);
+    const nextClose = template.indexOf(closeTag, pos);
+    const nextElse = depth === 1 ? template.indexOf(elseTag, pos) : -1;
+
+    // No closing tag found — treat rest as body
+    if (nextClose === -1) {
+      return { body: template.slice(startPos), elseBody: undefined, endPos: template.length };
+    }
+
+    // Check for else at current depth (before next open or close)
+    if (nextElse !== -1 && (nextOpen === -1 || nextElse < nextOpen) && nextElse < nextClose && elsePos === undefined) {
+      elsePos = nextElse;
+    }
+
+    // Opening tag comes first — increase depth
+    if (nextOpen !== -1 && nextOpen < nextClose) {
+      depth += 1;
+      pos = nextOpen + openTag.length;
+      continue;
+    }
+
+    // Closing tag
+    depth -= 1;
+    if (depth === 0) {
+      const endPos = nextClose + closeTag.length;
+      if (elsePos !== undefined) {
+        return {
+          body: template.slice(startPos, elsePos),
+          elseBody: template.slice(elsePos + elseTag.length, nextClose),
+          endPos,
+        };
+      }
+      return {
+        body: template.slice(startPos, nextClose),
+        elseBody: undefined,
+        endPos,
+      };
+    }
+    pos = nextClose + closeTag.length;
+  }
+
+  return { body: template.slice(startPos), elseBody: undefined, endPos: template.length };
+}
+
+function isTruthy(value: unknown): boolean {
+  if (value == null) return false;
+  if (value === false) return false;
+  if (value === 0) return false;
+  if (value === '') return false;
+  if (Array.isArray(value) && value.length === 0) return false;
+  return true;
 }
 
 function resolveTemplatePath(path: string, scope: unknown, rootData: unknown): unknown {
@@ -983,6 +1123,9 @@ function resolveTemplatePath(path: string, scope: unknown, rootData: unknown): u
   let current: unknown;
   if (parts[0] === 'data') {
     current = rootData;
+    parts.shift();
+  } else if (parts[0] === 'this') {
+    current = scope;
     parts.shift();
   } else {
     current = scope;

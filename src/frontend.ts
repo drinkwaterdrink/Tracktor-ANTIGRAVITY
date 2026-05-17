@@ -6,6 +6,7 @@ import {
   type TrackerSummary,
   type TracktorSettings,
   type StructuredOutputMode,
+  type TrackerPlacement,
   assertTrackerTemplateRenders,
   DEFAULT_JSON_PROMPT_TEMPLATE,
   DEFAULT_TOON_PROMPT_TEMPLATE,
@@ -597,6 +598,11 @@ function renderSettings(settings: TracktorSettings, current?: FrontendState): st
             ${renderTemplateEngineOptions(settings.templateEngine)}
           </select>
         </label>
+        <label>Tracker placement
+          <select data-setting="trackerPlacement">
+            ${renderTrackerPlacementOptions(settings.trackerPlacement)}
+          </select>
+        </label>
         <label>Recent messages
           <input data-setting="trackerContextMessageLimit" type="number" min="0" max="400" value="${settings.trackerContextMessageLimit}">
         </label>
@@ -734,6 +740,14 @@ function renderTemplateEngineOptions(value: TemplateEngine | undefined, includeE
   return `${empty}
     <option value="handlebars" ${value === 'handlebars' ? 'selected' : ''}>Handlebars</option>
     <option value="simple" ${value === 'simple' ? 'selected' : ''}>Simple fallback</option>
+  `;
+}
+
+function renderTrackerPlacementOptions(value: TrackerPlacement | undefined): string {
+  return `
+    <option value="message_bottom" ${value === 'message_bottom' || !value ? 'selected' : ''}>Message bottom</option>
+    <option value="message_top" ${value === 'message_top' ? 'selected' : ''}>Message top</option>
+    <option value="chat_top_pinned" ${value === 'chat_top_pinned' ? 'selected' : ''}>Chat top (pinned)</option>
   `;
 }
 

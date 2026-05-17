@@ -1,4 +1,4 @@
-import Handlebars from 'handlebars';
+// Built-in template engine — no external dependencies.
 export const EXTENSION_ID = 'tracktor';
 export const METADATA_KEY = 'tracktor';
 export const SETTINGS_PATH = 'settings.json';
@@ -200,6 +200,7 @@ export const defaultSettings = {
     allowedWorldBookEntryIds: [],
     debugLogging: false,
     templateEngine: 'handlebars',
+    trackerPlacement: 'message_bottom',
 };
 export function deepMergeSettings(input, schemaPresets) {
     const saved = isPlainObject(input) ? input : {};
@@ -242,6 +243,7 @@ export function deepMergeSettings(input, schemaPresets) {
     merged.generationMode = merged.structuredOutputMode === 'native_json_schema' ? 'native_json' : 'json';
     merged.trackerConversationRoleMode = normalizeEnum(saved.trackerConversationRoleMode, ['preserve', 'all_assistant', 'plain_transcript'], 'preserve');
     merged.templateEngine = normalizeTemplateEngine(saved.templateEngine);
+    merged.trackerPlacement = normalizeEnum(saved.trackerPlacement, ['message_bottom', 'message_top', 'chat_top_pinned'], 'message_bottom');
     merged.snapshotRole = normalizeEnum(saved.snapshotRole, ['system', 'user', 'assistant'], 'system');
     merged.trackerWorldBookMode = normalizeEnum(saved.trackerWorldBookMode, ['include_all', 'exclude_all', 'allowlist'], 'include_all');
     merged.snapshotTransformPresetKey = normalizeEnum(saved.snapshotTransformPresetKey, ['default_json', 'minimal', 'toon', 'custom'], 'default_json');
@@ -432,19 +434,13 @@ export function schemaToExample(schema) {
     }
 }
 export function renderTrackerTemplate(templateHtml, data, options = {}) {
-    const engine = options.templateEngine ?? 'handlebars';
     const sanitizedTemplate = stripDangerousHtml(templateHtml);
     try {
-        const rendered = engine === 'simple'
-            ? renderScopedTemplate(sanitizedTemplate, data, data)
-            : renderHandlebarsTemplate(sanitizedTemplate, data);
+        const rendered = renderBuiltinTemplate(sanitizedTemplate, data, data);
         return stripDangerousHtml(rendered);
     }
     catch (error) {
-        if (engine !== 'simple' && error instanceof Error && error.message === 'Handlebars renderer is unavailable.') {
-            options.onWarning?.(`Handlebars template renderer failed; falling back to simple renderer: ${error instanceof Error ? error.message : String(error)}`);
-            return stripDangerousHtml(renderScopedTemplate(sanitizedTemplate, data, data));
-        }
+        options.onWarning?.(`Template rendering failed: ${error instanceof Error ? error.message : String(error)}`);
         throw error;
     }
 }
@@ -647,56 +643,184 @@ function sanitizeInteger(value, fallback, min, max) {
         return fallback;
     return Math.min(max, Math.max(min, Math.floor(parsed)));
 }
-const handlebarsRuntime = (() => {
-    try {
-        const runtime = Handlebars.create();
-        runtime.registerHelper('join', (value, separator) => {
-            if (!Array.isArray(value))
-                return '';
-            const delimiter = typeof separator === 'string' ? separator : ', ';
-            return value.map((item) => typeof item === 'object' ? JSON.stringify(item) : String(item ?? '')).join(delimiter);
-        });
-        runtime.registerHelper('json', (value) => JSON.stringify(value, null, 2));
-        return runtime;
-    }
-    catch {
-        return null;
-    }
-})();
-function renderHandlebarsTemplate(template, data) {
-    if (!handlebarsRuntime) {
-        throw new Error('Handlebars renderer is unavailable.');
-    }
-    const compiled = handlebarsRuntime.compile(template, {
-        noEscape: false,
-        strict: false,
-    });
-    return compiled({ data }, {
-        allowProtoMethodsByDefault: false,
-        allowProtoPropertiesByDefault: false,
-    });
+/**
+ * Built-in safe template engine that handles the Handlebars subset used by
+ * zTracker / WTracker templates without any external dependency.
+ *
+ * Supported syntax:
+ *   {{data.x}}                    — escaped variable interpolation
+ *   {{{data.x}}}                  — raw interpolation (still sanitized after render)
+ *   {{#if data.x}}...{{/if}}      — conditional block
+ *   {{#if data.x}}...{{else}}...{{/if}}
+ *   {{#unless data.x}}...{{/unless}}
+ *   {{#each data.arr}}...{{/each}} — iteration (supports nesting)
+ *   {{this}}  / {{this.field}}     — current iteration item
+ *   {{join data.arr ', '}}         — join array helper
+ *   {{json data.x}}                — JSON pretty-print helper
+ */
+function renderBuiltinTemplate(template, scope, rootData) {
+    return processTemplate(template, scope, rootData, 0);
 }
-function renderScopedTemplate(template, scope, rootData) {
-    let rendered = template.replace(/{{#each\s+([^}]+)}}([\s\S]*?){{\/each}}/g, (_match, path, body) => {
-        const items = resolveTemplatePath(path.trim(), scope, rootData);
-        if (!Array.isArray(items))
-            return '';
-        return items.map((item) => renderScopedTemplate(body, item, rootData)).join('');
-    });
-    rendered = rendered.replace(/{{\s*join\s+([^\s}]+)\s+(['"])(.*?)\2\s*}}/g, (_match, path, _quote, separator) => {
-        const value = resolveTemplatePath(path.trim(), scope, rootData);
-        if (!Array.isArray(value))
-            return '';
-        return escapeHtml(value.map((item) => typeof item === 'object' ? JSON.stringify(item) : String(item)).join(separator));
-    });
-    rendered = rendered.replace(/{{\s*json\s+([^}]+)\s*}}/g, (_match, path) => {
-        const value = resolveTemplatePath(path.trim(), scope, rootData);
-        return escapeHtml(JSON.stringify(value, null, 2));
-    });
-    rendered = rendered.replace(/{{\s*([a-zA-Z0-9_.-]+|this)\s*}}/g, (_match, path) => {
-        return escapeHtml(resolveTemplatePath(path.trim(), scope, rootData));
-    });
-    return rendered;
+const MAX_TEMPLATE_DEPTH = 32;
+function processTemplate(template, scope, rootData, depth) {
+    if (depth > MAX_TEMPLATE_DEPTH)
+        return '<!-- template depth exceeded -->';
+    let result = '';
+    let pos = 0;
+    while (pos < template.length) {
+        // Find the next tag
+        const tagStart = template.indexOf('{{', pos);
+        if (tagStart === -1) {
+            result += template.slice(pos);
+            break;
+        }
+        // Output text before the tag
+        result += template.slice(pos, tagStart);
+        // Check for triple-stache {{{raw}}}
+        if (template[tagStart + 2] === '{') {
+            const tripleEnd = template.indexOf('}}}', tagStart + 3);
+            if (tripleEnd === -1) {
+                result += '{{{';
+                pos = tagStart + 3;
+                continue;
+            }
+            const inner = template.slice(tagStart + 3, tripleEnd).trim();
+            const value = resolveTemplatePath(inner, scope, rootData);
+            result += String(value ?? '');
+            pos = tripleEnd + 3;
+            continue;
+        }
+        const tagEnd = template.indexOf('}}', tagStart + 2);
+        if (tagEnd === -1) {
+            result += template.slice(tagStart);
+            break;
+        }
+        const tagContent = template.slice(tagStart + 2, tagEnd).trim();
+        pos = tagEnd + 2;
+        // Block helpers: {{#each}}, {{#if}}, {{#unless}}
+        const blockMatch = tagContent.match(/^#(each|if|unless)\s+(.+)$/);
+        if (blockMatch) {
+            const [, blockType, blockPath] = blockMatch;
+            const { body, elseBody, endPos } = findBlockEnd(template, pos, blockType);
+            pos = endPos;
+            if (blockType === 'each') {
+                const items = resolveTemplatePath(blockPath.trim(), scope, rootData);
+                if (Array.isArray(items)) {
+                    result += items.map((item) => processTemplate(body, item, rootData, depth + 1)).join('');
+                }
+                else if (elseBody !== undefined) {
+                    result += processTemplate(elseBody, scope, rootData, depth + 1);
+                }
+            }
+            else if (blockType === 'if') {
+                const value = resolveTemplatePath(blockPath.trim(), scope, rootData);
+                if (isTruthy(value)) {
+                    result += processTemplate(body, scope, rootData, depth + 1);
+                }
+                else if (elseBody !== undefined) {
+                    result += processTemplate(elseBody, scope, rootData, depth + 1);
+                }
+            }
+            else if (blockType === 'unless') {
+                const value = resolveTemplatePath(blockPath.trim(), scope, rootData);
+                if (!isTruthy(value)) {
+                    result += processTemplate(body, scope, rootData, depth + 1);
+                }
+                else if (elseBody !== undefined) {
+                    result += processTemplate(elseBody, scope, rootData, depth + 1);
+                }
+            }
+            continue;
+        }
+        // {{join path 'sep'}} helper
+        const joinMatch = tagContent.match(/^join\s+(\S+)\s+(['"])(.*?)\2$/);
+        if (joinMatch) {
+            const value = resolveTemplatePath(joinMatch[1].trim(), scope, rootData);
+            if (Array.isArray(value)) {
+                result += escapeHtml(value.map((item) => typeof item === 'object' ? JSON.stringify(item) : String(item)).join(joinMatch[3]));
+            }
+            continue;
+        }
+        // {{json path}} helper
+        const jsonMatch = tagContent.match(/^json\s+(.+)$/);
+        if (jsonMatch) {
+            const value = resolveTemplatePath(jsonMatch[1].trim(), scope, rootData);
+            result += escapeHtml(JSON.stringify(value, null, 2));
+            continue;
+        }
+        // {{variable}} — escaped interpolation
+        if (/^[a-zA-Z0-9_.@-]+$/.test(tagContent) || tagContent === 'this') {
+            result += escapeHtml(resolveTemplatePath(tagContent, scope, rootData));
+            continue;
+        }
+        // Unknown tag — output as-is
+        result += `{{${tagContent}}}`;
+    }
+    return result;
+}
+/**
+ * Finds the matching {{/blockType}} for an opening block tag, correctly
+ * handling nested blocks of the same type. Returns the body, optional else
+ * body, and the position after the closing tag.
+ */
+function findBlockEnd(template, startPos, blockType) {
+    const openTag = `{{#${blockType}`;
+    const closeTag = `{{/${blockType}}}`;
+    const elseTag = '{{else}}';
+    let depth = 1;
+    let pos = startPos;
+    let elsePos;
+    while (pos < template.length && depth > 0) {
+        const nextOpen = template.indexOf(openTag, pos);
+        const nextClose = template.indexOf(closeTag, pos);
+        const nextElse = depth === 1 ? template.indexOf(elseTag, pos) : -1;
+        // No closing tag found — treat rest as body
+        if (nextClose === -1) {
+            return { body: template.slice(startPos), elseBody: undefined, endPos: template.length };
+        }
+        // Check for else at current depth (before next open or close)
+        if (nextElse !== -1 && (nextOpen === -1 || nextElse < nextOpen) && nextElse < nextClose && elsePos === undefined) {
+            elsePos = nextElse;
+        }
+        // Opening tag comes first — increase depth
+        if (nextOpen !== -1 && nextOpen < nextClose) {
+            depth += 1;
+            pos = nextOpen + openTag.length;
+            continue;
+        }
+        // Closing tag
+        depth -= 1;
+        if (depth === 0) {
+            const endPos = nextClose + closeTag.length;
+            if (elsePos !== undefined) {
+                return {
+                    body: template.slice(startPos, elsePos),
+                    elseBody: template.slice(elsePos + elseTag.length, nextClose),
+                    endPos,
+                };
+            }
+            return {
+                body: template.slice(startPos, nextClose),
+                elseBody: undefined,
+                endPos,
+            };
+        }
+        pos = nextClose + closeTag.length;
+    }
+    return { body: template.slice(startPos), elseBody: undefined, endPos: template.length };
+}
+function isTruthy(value) {
+    if (value == null)
+        return false;
+    if (value === false)
+        return false;
+    if (value === 0)
+        return false;
+    if (value === '')
+        return false;
+    if (Array.isArray(value) && value.length === 0)
+        return false;
+    return true;
 }
 function resolveTemplatePath(path, scope, rootData) {
     if (path === 'this')
@@ -707,6 +831,10 @@ function resolveTemplatePath(path, scope, rootData) {
     let current;
     if (parts[0] === 'data') {
         current = rootData;
+        parts.shift();
+    }
+    else if (parts[0] === 'this') {
+        current = scope;
         parts.shift();
     }
     else {
