@@ -76,6 +76,9 @@ let pinnedHudCleanup: (() => void) | null = null;
 let widgetTopObserver: MutationObserver | null = null;
 let floatingFabElement: HTMLElement | null = null;
 let floatingFabCleanup: (() => void) | null = null;
+type TracktorView = 'current' | 'settings' | 'preset' | 'diagnostics';
+let activeView: TracktorView = 'current';
+let presetDraftDirty = false;
 
 export function setup(ctx: SpindleFrontendContext) {
   ctxRef = ctx;
@@ -95,6 +98,16 @@ export function setup(ctx: SpindleFrontendContext) {
   const unbindOpenAction = openAction?.onClick(() => {
     placement.activate();
     sendBackend({ type: 'refresh_state' });
+  });
+
+  const generateAction = ctx.ui?.registerInputBarAction?.({
+    id: 'generate-tracktor-tracker',
+    label: 'Generate Tracker',
+    enabled: false,
+    iconSvg: TRACKTOR_SMALL_ICON,
+  });
+  const unbindGenerateAction = generateAction?.onClick(() => {
+    sendBackend({ type: 'generate_tracker' });
   });
 
   const toggleInjectionAction = ctx.ui?.registerInputBarAction?.({
@@ -164,10 +177,11 @@ export function setup(ctx: SpindleFrontendContext) {
       state = payload.state;
       lastKnownChatId = state?.activeChat?.id ?? lastKnownChatId;
       placement.setBadge(state?.activeChat?.trackers.length ? String(state.activeChat.trackers.length) : null);
-      render();
+      if (!(presetDraftDirty && activeView === 'preset')) render();
       renderMessageWidgets();
       renderPinnedHud();
       renderDomToolbarAction();
+      generateAction?.setEnabled(!!state?.activeChat && !state.busy);
     } else if (payload?.type === 'diagnostic') {
       if (!state) return;
       state.diagnostics = [String(payload.message ?? 'Diagnostic'), ...(state.diagnostics ?? [])].slice(0, 12);
@@ -221,6 +235,8 @@ export function setup(ctx: SpindleFrontendContext) {
     if (domToolbarActionElement) domToolbarActionElement.remove();
     unbindOpenAction?.();
     openAction?.destroy();
+    unbindGenerateAction?.();
+    generateAction?.destroy();
     unbindToggleInjectionAction?.();
     toggleInjectionAction?.destroy();
     unbindActivate();
@@ -473,7 +489,7 @@ function render(): void {
     if (!state) {
       root.innerHTML = `
         <div class="tracktor-shell">
-          ${renderHeader()}
+          ${renderHeader(activeView)}
           <section class="tracktor-section tracktor-toolbar">
             <div>
               <strong>Connecting to Tracktor</strong>
@@ -485,8 +501,7 @@ function render(): void {
             </div>
           </section>
           <div class="tracktor-empty">Loading Tracktor state...</div>
-          ${renderSettings(defaultSettings)}
-          ${renderSchemaEditor(defaultSettings)}
+          ${renderQuickControls(defaultSettings)}
         </div>
       `;
       continue;
@@ -494,18 +509,17 @@ function render(): void {
 
     root.innerHTML = `
       <div class="tracktor-shell">
-        ${renderHeader()}
+        ${renderHeader(activeView)}
         ${renderStatus(state)}
         ${renderToolbar(state)}
-        ${renderTrackers(state)}
-        ${renderSettings(state.settings, state)}
-        ${renderSchemaEditor(state.settings, state)}
+        ${renderQuickControls(state.settings, state)}
+        ${renderActiveView(state, activeView)}
       </div>
     `;
   }
 }
 
-function renderHeader(): string {
+function renderHeader(view: TracktorView): string {
   return `
     <header class="tracktor-header">
       <div>
@@ -513,13 +527,24 @@ function renderHeader(): string {
         <span>Tracker presets and snapshots for Lumiverse chats</span>
       </div>
       <div class="tracktor-tabs" aria-label="Tracktor sections">
-        <span>Current</span>
-        <span>Settings</span>
-        <span>Preset</span>
-        <span>Diagnostics</span>
+        ${renderViewButton('current', 'Current', view)}
+        ${renderViewButton('settings', 'Settings', view)}
+        ${renderViewButton('preset', 'Preset', view)}
+        ${renderViewButton('diagnostics', 'Diagnostics', view)}
       </div>
     </header>
   `;
+}
+
+function renderViewButton(view: TracktorView, label: string, current: TracktorView): string {
+  return `<button type="button" class="tracktor-tab-button ${view === current ? 'is-active' : ''}" data-action="set-view" data-view="${view}" aria-pressed="${view === current ? 'true' : 'false'}">${label}</button>`;
+}
+
+function renderActiveView(current: FrontendState, view: TracktorView): string {
+  if (view === 'settings') return renderSettings(current.settings, current);
+  if (view === 'preset') return renderSchemaEditor(current.settings, current);
+  if (view === 'diagnostics') return renderDiagnosticsPanel(current);
+  return renderTrackers(current);
 }
 
 function renderStatus(current: FrontendState): string {
@@ -546,8 +571,7 @@ function renderToolbar(current: FrontendState): string {
       </div>
       <div class="tracktor-actions">
         <button type="button" data-action="refresh">Refresh</button>
-        <button type="button" data-action="generate-latest" ${chat && !current.busy ? '' : 'disabled'}>Generate Tracker</button>
-        <button type="button" data-action="generate-latest-sequential" ${chat && !current.busy ? '' : 'disabled'}>Generate Sequential</button>
+        <button type="button" data-action="copy-latest" ${chat?.trackers.length ? '' : 'disabled'}>Copy Latest</button>
       </div>
     </section>
   `;
@@ -606,7 +630,7 @@ function toKebabCase(value: string): string {
   return value.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
 }
 
-function renderSettings(settings: TracktorSettings, current?: FrontendState): string {
+function renderQuickControls(settings: TracktorSettings, current?: FrontendState): string {
   const chat = current?.activeChat;
   return `
     <section class="tracktor-section">
@@ -637,11 +661,20 @@ function renderSettings(settings: TracktorSettings, current?: FrontendState): st
         <button type="button" data-action="generate-latest-sequential" ${chat && !current?.busy ? '' : 'disabled'}>Generate Sequential</button>
         <button type="button" data-action="save-settings">Save Settings</button>
       </div>
+    </section>
+  `;
+}
+
+function renderSettings(settings: TracktorSettings, current?: FrontendState): string {
+  return `
+    <section class="tracktor-section">
+      <h2>Settings</h2>
       <details class="tracktor-details">
         <summary>Generation</summary>
         <div class="tracktor-form-grid">
           <label>Lumiverse generation preset
-            <input data-setting="trackerPresetId" value="${escapeHtml(settings.trackerPresetId ?? '')}" placeholder="Optional id">
+            <input data-setting="trackerPresetId" value="${escapeHtml(settings.trackerPresetId ?? '')}" placeholder="Stored for future support">
+            <span class="tracktor-field-hint">Stored for compatibility; not active in this build.</span>
           </label>
         <label>Template engine
           <select data-setting="templateEngine">
@@ -669,10 +702,6 @@ function renderSettings(settings: TracktorSettings, current?: FrontendState): st
           <input data-setting="sequentialGeneration" type="checkbox" ${settings.sequentialGeneration ? 'checked' : ''}>
           Sequential part generation
         </label>
-        <label class="tracktor-check">
-          <input data-setting="includeCharacterCardInTrackerPrompt" type="checkbox" ${settings.includeCharacterCardInTrackerPrompt ? 'checked' : ''}>
-          Include character card
-        </label>
         <label>Conversation roles
           <select data-setting="trackerConversationRoleMode">
             <option value="preserve" ${settings.trackerConversationRoleMode === 'preserve' ? 'selected' : ''}>Preserve</option>
@@ -680,6 +709,39 @@ function renderSettings(settings: TracktorSettings, current?: FrontendState): st
             <option value="plain_transcript" ${settings.trackerConversationRoleMode === 'plain_transcript' ? 'selected' : ''}>Plain transcript</option>
           </select>
         </label>
+        </div>
+      </details>
+      <details class="tracktor-details">
+        <summary>Future compatibility</summary>
+        <p class="tracktor-muted">These settings are preserved for zTracker parity work but are not wired into generation yet.</p>
+        <div class="tracktor-form-grid">
+          <label class="tracktor-check">
+            <input data-setting="includeCharacterCardInTrackerPrompt" type="checkbox" ${settings.includeCharacterCardInTrackerPrompt ? 'checked' : ''}>
+            Include character card
+          </label>
+          <label>World-book mode
+            <select data-setting="trackerWorldBookMode">
+              <option value="include_all" ${settings.trackerWorldBookMode === 'include_all' ? 'selected' : ''}>Include all</option>
+              <option value="exclude_all" ${settings.trackerWorldBookMode === 'exclude_all' ? 'selected' : ''}>Exclude all</option>
+              <option value="allowlist" ${settings.trackerWorldBookMode === 'allowlist' ? 'selected' : ''}>Allowlist</option>
+            </select>
+          </label>
+          <label>Allowed world-book ids
+            <input data-setting="allowedWorldBookIds" value="${escapeHtml(settings.allowedWorldBookIds.join(', '))}" placeholder="Stored only">
+          </label>
+          <label>Allowed entry ids
+            <input data-setting="allowedWorldBookEntryIds" value="${escapeHtml(settings.allowedWorldBookEntryIds.join(', '))}" placeholder="Stored only">
+          </label>
+          <label>System prompt source
+            <select data-setting="trackerSystemPromptSource">
+              <option value="active_preset" ${settings.trackerSystemPromptSource === 'active_preset' ? 'selected' : ''}>Active preset</option>
+              <option value="selected_tracker_preset" ${settings.trackerSystemPromptSource === 'selected_tracker_preset' ? 'selected' : ''}>Selected tracker preset</option>
+              <option value="saved_tracker_prompt" ${settings.trackerSystemPromptSource === 'saved_tracker_prompt' ? 'selected' : ''}>Saved tracker prompt</option>
+            </select>
+          </label>
+          <label>Saved tracker prompt id
+            <input data-setting="savedTrackerPromptId" value="${escapeHtml(settings.savedTrackerPromptId ?? '')}" placeholder="Stored only">
+          </label>
         </div>
       </details>
       <details class="tracktor-details">
@@ -718,14 +780,20 @@ function renderSettings(settings: TracktorSettings, current?: FrontendState): st
         </label>
         </div>
       </details>
-      <details class="tracktor-details">
-        <summary>Diagnostics</summary>
-        <label class="tracktor-check">
-          <input data-setting="debugLogging" type="checkbox" ${settings.debugLogging ? 'checked' : ''}>
-          Debug logging
-        </label>
-        ${(current?.diagnostics?.length ?? 0) > 0 ? current!.diagnostics.map((item) => `<p class="tracktor-diagnostic-line">${escapeHtml(item)}</p>`).join('') : '<p class="tracktor-muted">No diagnostics yet.</p>'}
-      </details>
+    </section>
+  `;
+}
+
+function renderDiagnosticsPanel(current: FrontendState): string {
+  return `
+    <section class="tracktor-section">
+      <h2>Diagnostics</h2>
+      <label class="tracktor-check">
+        <input data-setting="debugLogging" type="checkbox" ${current.settings.debugLogging ? 'checked' : ''}>
+        Debug logging
+      </label>
+      ${(current.diagnostics?.length ?? 0) > 0 ? current.diagnostics.map((item) => `<p class="tracktor-diagnostic-line">${escapeHtml(item)}</p>`).join('') : '<p class="tracktor-muted">No diagnostics yet.</p>'}
+      ${current.lastError ? `<p class="tracktor-error-text">${escapeHtml(current.lastError)}</p>` : ''}
     </section>
   `;
 }
@@ -823,6 +891,7 @@ function renderSchemaEditor(settings: TracktorSettings, current?: FrontendState)
     <section class="tracktor-section">
       <details class="tracktor-details" data-preset-editor>
         <summary>Preset Editor</summary>
+        <p class="tracktor-muted" data-preset-dirty>${presetDraftDirty ? 'Unsaved preset changes.' : 'Paste or edit a tracker preset, preview it, then save.'}</p>
         <div class="tracktor-form-grid">
           <label>Preset id
             <input data-preset-field="id" value="${escapeHtml(active.id)}" ${active.key === 'scene' ? 'readonly' : ''}>
@@ -866,6 +935,8 @@ function renderSchemaEditor(settings: TracktorSettings, current?: FrontendState)
           <textarea data-preset-field="toonPromptTemplate" rows="4">${escapeHtml(active.toonPromptTemplate || settings.toonPromptTemplate)}</textarea>
         </label>
         <div class="tracktor-actions">
+          <button type="button" data-action="import-preset">Import zTracker/WTracker Preset</button>
+          <button type="button" data-action="preview-preset">Preview Template</button>
           <button type="button" data-action="new-preset">New Preset</button>
           <button type="button" data-action="duplicate-preset">Duplicate Preset</button>
           <button type="button" data-action="save-preset">Save Preset</button>
@@ -884,7 +955,13 @@ function handleClick(event: Event): void {
   if (!button) return;
   const action = button.dataset.action;
 
-  if (action === 'refresh') {
+  if (action === 'set-view') {
+    const view = button.dataset.view;
+    if (view === 'current' || view === 'settings' || view === 'preset' || view === 'diagnostics') {
+      activeView = view;
+      render();
+    }
+  } else if (action === 'refresh') {
     sendBackend({ type: 'refresh_state' });
   } else if (action === 'open-extension-settings') {
     ctxRef.events?.emit?.('open-settings', { view: 'extensions' });
@@ -894,6 +971,8 @@ function handleClick(event: Event): void {
     sendBackend({ type: 'generate_tracker', chatId: state.activeChat?.id });
   } else if (action === 'generate-latest-sequential') {
     sendBackend({ type: 'generate_tracker', chatId: state.activeChat?.id, sequential: true });
+  } else if (action === 'copy-latest') {
+    void copyLatestSnapshot();
   } else if (action === 'regenerate') {
     sendBackend({ type: 'regenerate_tracker', chatId: button.dataset.chatId, messageId: button.dataset.messageId });
   } else if (action === 'regenerate-part') {
@@ -908,6 +987,10 @@ function handleClick(event: Event): void {
     restoreDefaultPrompts();
   } else if (action === 'save-schema' || action === 'save-preset') {
     savePresetFromDom(getPresetEditorForAction(button));
+  } else if (action === 'preview-preset') {
+    previewPresetFromDom(getPresetEditorForAction(button));
+  } else if (action === 'import-preset') {
+    openImportPresetModal();
   } else if (action === 'new-preset') {
     createNewPreset();
   } else if (action === 'duplicate-preset') {
@@ -927,16 +1010,31 @@ function handleClick(event: Event): void {
 
 function handleChange(event: Event): void {
   const target = event.target as HTMLInputElement | HTMLSelectElement | null;
+  if (target?.dataset.presetField) {
+    markPresetDirty(target);
+    return;
+  }
   if (!target?.dataset.setting || !state) return;
   applySettingValue(target);
-  render();
+  if (!presetDraftDirty) render();
   if (target.dataset.autosave === 'settings') saveSettingsFromDom();
 }
 
 function handleInput(event: Event): void {
   const target = event.target as HTMLInputElement | HTMLTextAreaElement | null;
+  if (target?.dataset.presetField) {
+    markPresetDirty(target);
+    return;
+  }
   if (!target?.dataset.setting || !state) return;
   applySettingValue(target);
+}
+
+function markPresetDirty(target: HTMLElement): void {
+  presetDraftDirty = true;
+  const root = target.closest('.tracktor-root') ?? document;
+  const dirty = root.querySelector('[data-preset-dirty]');
+  if (dirty) dirty.textContent = 'Unsaved preset changes.';
 }
 
 function applySettingValue(target: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement): void {
@@ -952,6 +1050,8 @@ function applySettingValue(target: HTMLInputElement | HTMLSelectElement | HTMLTe
     owner[key] = target.checked;
   } else if (target instanceof HTMLInputElement && target.type === 'number') {
     owner[key] = Number.parseInt(target.value, 10);
+  } else if (key === 'allowedWorldBookIds' || key === 'allowedWorldBookEntryIds') {
+    owner[key] = target.value.split(/[\n, ]+/).map((item) => item.trim()).filter(Boolean);
   } else {
     owner[key] = target.value;
   }
@@ -996,6 +1096,167 @@ function savePresetFromDom(editor: HTMLElement): void {
   } catch (error) {
     showErrorModal(error instanceof Error ? error.message : String(error));
   }
+}
+
+function previewPresetFromDom(editor: HTMLElement): void {
+  if (!state) return;
+  try {
+    const preset = readPresetFromDom(editor, getActiveTrackerPreset(state.settings));
+    const engine = preset.templateEngine ?? state.settings.templateEngine ?? 'handlebars';
+    const html = assertTrackerTemplateRenders(preset.renderTemplate, schemaToExample(preset.schema), {
+      templateEngine: engine,
+      label: `Tracker preset "${preset.name}" (${preset.key})`,
+    });
+    showHtmlModal('Template Preview', `<div class="tracktor-preview tracktor-rendered">${stripDangerousHtml(html)}</div>`);
+  } catch (error) {
+    showErrorModal(error instanceof Error ? error.message : String(error));
+  }
+}
+
+function openImportPresetModal(): void {
+  if (!state) return;
+  if (typeof ctxRef.ui?.showModal !== 'function') {
+    const text = window.prompt('Paste zTracker/WTracker preset JSON');
+    if (text) importPresetText(text);
+    return;
+  }
+
+  const modal = ctxRef.ui.showModal({ title: 'Import zTracker/WTracker Preset', width: 760, maxHeight: 760 });
+  modal.root.innerHTML = `
+    <div class="tracktor-modal-body">
+      <p class="tracktor-muted">Paste a JSON object that contains a schema, HTML/Handlebars template, and extraction prompt.</p>
+      <textarea class="tracktor-json-editor" spellcheck="false" placeholder='{"name":"My Tracker","schema":{},"templateHtml":"...","trackerInstructionPrompt":"..."}'></textarea>
+      <div class="tracktor-actions">
+        <button type="button" data-modal-action="import">Import</button>
+        <button type="button" data-modal-action="cancel">Cancel</button>
+      </div>
+    </div>
+  `;
+  modal.root.addEventListener('click', (event) => {
+    const action = (event.target as HTMLElement | null)?.closest('[data-modal-action]') as HTMLElement | null;
+    if (!action) return;
+    if (action.dataset.modalAction === 'cancel') {
+      modal.dismiss();
+      return;
+    }
+    const textarea = modal.root.querySelector('.tracktor-json-editor') as HTMLTextAreaElement | null;
+    if (!textarea) return;
+    try {
+      importPresetText(textarea.value);
+      modal.dismiss();
+    } catch (error) {
+      showErrorModal(error instanceof Error ? error.message : String(error));
+    }
+  });
+}
+
+function importPresetText(text: string): void {
+  if (!state) return;
+  const imported = readImportedPreset(text, state.settings);
+  const settings = structuredClone(state.settings);
+  const key = makeUniquePresetKey(settings, imported.key);
+  const preset: SchemaPreset = {
+    ...imported,
+    id: key,
+    key,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  const engine = preset.templateEngine ?? settings.templateEngine ?? 'handlebars';
+  assertTrackerTemplateRenders(preset.renderTemplate, schemaToExample(preset.schema), {
+    templateEngine: engine,
+    label: `Tracker preset "${preset.name}" (${preset.key})`,
+  });
+  settings.schemaPresets[key] = preset;
+  setActivePreset(settings, key);
+  activeView = 'preset';
+  persistSettings(settings, key);
+}
+
+function readImportedPreset(text: string, settings: TracktorSettings): SchemaPreset {
+  const raw = JSON.parse(text);
+  const candidate = selectImportCandidate(raw);
+  const schema = readFirstObject(candidate, ['jsonSchema', 'schema', 'schemaJson', 'trackerSchema']);
+  if (!schema) throw new Error('Imported preset needs a JSON schema object.');
+  const templateHtml = readFirstString(candidate, ['templateHtml', 'renderTemplate', 'htmlTemplate', 'trackerHtml', 'html', 'template']);
+  if (!templateHtml) throw new Error('Imported preset needs an HTML/Handlebars template.');
+  const trackerInstructionPrompt = readFirstString(candidate, ['trackerInstructionPrompt', 'extractionPrompt', 'trackerPrompt', 'prompt', 'generationPrompt'])
+    || DEFAULT_EXTRACTION_PROMPT;
+  const systemPrompt = readFirstString(candidate, ['systemPrompt']) || settings.systemPrompt || DEFAULT_SYSTEM_PROMPT;
+  const name = readFirstString(candidate, ['name', 'title', 'presetName', 'humanName']) || String(schema.title ?? 'Imported Tracker Preset');
+  const key = sanitizeId(readFirstString(candidate, ['key', 'id']) || name) || 'imported_tracker';
+  const base = defaultSettings.schemaPresets.scene;
+  return {
+    ...structuredClone(base),
+    id: key,
+    key,
+    name,
+    description: readFirstString(candidate, ['description']) || 'Imported zTracker/WTracker preset.',
+    schema,
+    jsonSchema: schema,
+    templateHtml,
+    renderTemplate: templateHtml,
+    systemPrompt,
+    extractionPrompt: trackerInstructionPrompt,
+    trackerInstructionPrompt,
+    jsonPromptTemplate: readFirstString(candidate, ['jsonPromptTemplate']) || settings.jsonPromptTemplate || DEFAULT_JSON_PROMPT_TEMPLATE,
+    xmlPromptTemplate: readFirstString(candidate, ['xmlPromptTemplate']) || settings.xmlPromptTemplate || DEFAULT_XML_PROMPT_TEMPLATE,
+    toonPromptTemplate: readFirstString(candidate, ['toonPromptTemplate']) || settings.toonPromptTemplate || DEFAULT_TOON_PROMPT_TEMPLATE,
+    templateEngine: 'handlebars',
+  };
+}
+
+function selectImportCandidate(raw: unknown): Record<string, unknown> {
+  if (Array.isArray(raw)) {
+    const firstObject = raw.find(isPlainImportObject);
+    if (firstObject) return firstObject;
+  }
+  if (!isPlainImportObject(raw)) throw new Error('Imported preset JSON must be an object.');
+  const containers = ['preset', 'trackerPreset', 'schemaPreset'];
+  for (const key of containers) {
+    const nested = raw[key];
+    if (isPlainImportObject(nested)) return nested;
+  }
+  for (const key of ['schemaPresets', 'trackerPresets', 'presets']) {
+    const value = raw[key];
+    if (Array.isArray(value)) {
+      const firstObject = value.find(isPlainImportObject);
+      if (firstObject) return firstObject;
+    }
+    if (isPlainImportObject(value)) {
+      const firstObject = Object.values(value).find(isPlainImportObject);
+      if (firstObject) return firstObject;
+    }
+  }
+  return raw;
+}
+
+function readFirstObject(source: Record<string, unknown>, keys: string[]): Record<string, unknown> | undefined {
+  for (const key of keys) {
+    const value = source[key];
+    if (isPlainImportObject(value)) return value;
+    if (typeof value === 'string') {
+      try {
+        const parsed = JSON.parse(value);
+        if (isPlainImportObject(parsed)) return parsed;
+      } catch {
+        // Try the next key.
+      }
+    }
+  }
+  return undefined;
+}
+
+function readFirstString(source: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = source[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+function isPlainImportObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
 function readPresetFromDom(editor: HTMLElement, previous?: SchemaPreset): SchemaPreset {
@@ -1130,6 +1391,7 @@ function setActivePreset(settings: TracktorSettings, key: string): void {
 
 function persistSettings(settings: TracktorSettings, validatePresetKey?: string): void {
   if (!state) return;
+  presetDraftDirty = false;
   state.settings = deepMergeSettings(settings, settings.schemaPresets);
   ctxRef.sendToBackend({ type: 'save_settings', settings: state.settings, ...(validatePresetKey ? { validatePresetKey } : {}) });
   render();
@@ -1199,6 +1461,22 @@ async function confirmDelete(chatId?: string, messageId?: string): Promise<void>
   }
 }
 
+async function copyLatestSnapshot(): Promise<void> {
+  const latest = state?.activeChat?.trackers.at(-1);
+  if (!latest) return;
+  const text = JSON.stringify(latest.tracker.data, null, 2);
+  try {
+    if (typeof navigator.clipboard?.writeText !== 'function') throw new Error('Clipboard API is unavailable.');
+    await navigator.clipboard.writeText(text);
+    showHtmlModal('Tracktor', '<p class="tracktor-muted">Latest tracker JSON copied.</p>');
+  } catch {
+    showHtmlModal(
+      'Copy Latest Tracker',
+      `<textarea class="tracktor-json-editor" readonly spellcheck="false">${escapeHtml(text)}</textarea>`,
+    );
+  }
+}
+
 function showErrorModal(message: string): void {
   if (typeof ctxRef.ui?.showModal !== 'function') {
     window.alert(`Tracktor Error: ${message}`);
@@ -1207,6 +1485,16 @@ function showErrorModal(message: string): void {
 
   const modal = ctxRef.ui.showModal({ title: 'Tracktor Error', width: 420, maxHeight: 320 });
   modal.root.innerHTML = `<p class="tracktor-error-text">${escapeHtml(message)}</p>`;
+}
+
+function showHtmlModal(title: string, html: string): void {
+  if (typeof ctxRef.ui?.showModal !== 'function') {
+    window.alert(stripDangerousHtml(html).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim() || title);
+    return;
+  }
+
+  const modal = ctxRef.ui.showModal({ title, width: 720, maxHeight: 720 });
+  modal.root.innerHTML = stripDangerousHtml(html);
 }
 
 function renderMessageWidgets(): void {
@@ -1371,12 +1659,7 @@ function renderPinnedHud(): void {
     </div>
   `;
 
-  if (pinnedHudElement) {
-    // Update in place instead of duplicating
-    pinnedHudElement.innerHTML = hudHtml;
-    attachPinnedHudHandlers(pinnedHudElement, latest);
-    return;
-  }
+  if (pinnedHudElement) cleanupPinnedHud();
 
   // Try to inject at top of chat area
   const chatMountTargets = [
@@ -1427,13 +1710,13 @@ function attachPinnedHudHandlers(container: HTMLElement, tracker: TrackerSummary
   const toggle = container.querySelector('.tracktor-pinned-toggle');
   const body = container.querySelector('.tracktor-pinned-body');
   if (toggle && body) {
-    toggle.addEventListener('click', () => {
+    (toggle as HTMLElement).onclick = () => {
       body.classList.toggle('tracktor-pinned-collapsed');
-    });
+    };
   }
 
   // Action buttons
-  container.addEventListener('click', (event) => {
+  container.onclick = (event) => {
     const button = (event.target as HTMLElement | null)?.closest('[data-action]') as HTMLElement | null;
     if (!button) return;
     const action = button.dataset.action;
@@ -1444,7 +1727,7 @@ function attachPinnedHudHandlers(container: HTMLElement, tracker: TrackerSummary
     } else if (action === 'delete') {
       void confirmDelete(tracker.chatId, tracker.messageId);
     }
-  });
+  };
 }
 
 function cleanupPinnedHud(): void {
@@ -1468,8 +1751,8 @@ function buildWidgetHtml(item: TrackerSummary): string {
       button { border: 1px solid var(--lumiverse-border, #444); background: var(--lumiverse-fill, #111); color: inherit; border-radius: 7px; cursor: pointer; }
       button:hover, button:focus-visible { border-color: var(--lumiverse-border-hover, #777); outline: none; }
       .actions { display: flex; gap: 5px; flex-wrap: nowrap; align-items: center; }
-      .icon-button { width: 22px; height: 22px; padding: 0; display: inline-grid; place-items: center; flex: 0 0 auto; border-radius: 4px; }
-      .icon-button svg { width: 12px; height: 12px; display: block; }
+      .icon-button { width: 30px; height: 30px; padding: 0; display: inline-grid; place-items: center; flex: 0 0 auto; border-radius: 6px; }
+      .icon-button svg { width: 15px; height: 15px; display: block; }
       table { width: 100%; border-collapse: collapse; }
       td { border-top: 1px solid var(--lumiverse-border, #444); padding: 4px 6px; vertical-align: top; }
       details { margin-top: 8px; }
@@ -1605,12 +1888,22 @@ const STYLES = `
     gap: 4px;
     justify-content: flex-end;
   }
-  .tracktor-tabs span {
+  .tracktor-tab-button {
     border: 1px solid var(--lumiverse-border);
     border-radius: 6px;
     padding: 4px 6px;
     color: var(--lumiverse-text);
     background: var(--lumiverse-fill-subtle);
+    cursor: pointer;
+    font: inherit;
+  }
+  .tracktor-tab-button.is-active {
+    border-color: var(--lumiverse-accent, #58a6ff);
+    color: var(--lumiverse-accent, #58a6ff);
+  }
+  .tracktor-tab-button:focus-visible {
+    outline: 2px solid var(--lumiverse-accent, #58a6ff);
+    outline-offset: 2px;
   }
   .tracktor-section { border-top: 1px solid var(--lumiverse-border); padding-top: 10px; }
   .tracktor-section:first-child { border-top: 0; padding-top: 0; }
@@ -1630,15 +1923,15 @@ const STYLES = `
   .tracktor-primary-actions { margin-top: 8px; }
   .tracktor-icon-actions { flex-wrap: nowrap; }
   .tracktor-icon-button {
-    width: 22px;
-    height: 22px;
+    width: 30px;
+    height: 30px;
     padding: 0 !important;
     display: inline-grid;
     place-items: center;
     flex: 0 0 auto;
-    border-radius: 4px !important;
+    border-radius: 6px !important;
   }
-  .tracktor-icon-button svg { width: 12px; height: 12px; display: block; }
+  .tracktor-icon-button svg { width: 15px; height: 15px; display: block; }
   .tracktor-icon-button:focus-visible { outline: 2px solid var(--lumiverse-accent); outline-offset: 2px; }
   .tracktor-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   .tracktor-common-controls { align-items: end; }
@@ -1660,6 +1953,15 @@ const STYLES = `
   .tracktor-details[open] > summary { margin-bottom: 8px; }
   .tracktor-advanced-inline { font-size: 11px; color: var(--lumiverse-text-muted); }
   .tracktor-diagnostic-line, .tracktor-muted { margin: 6px 0 0; color: var(--lumiverse-text-muted); font-size: 12px; }
+  .tracktor-field-hint { display: block; color: var(--lumiverse-text-muted); font-size: 10px; }
+  .tracktor-preview {
+    border: 1px solid var(--lumiverse-border, #444);
+    background: var(--lumiverse-fill-subtle, #1f1f1f);
+    border-radius: 8px;
+    padding: 10px;
+    max-height: 520px;
+    overflow: auto;
+  }
   .tracktor-section label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--lumiverse-text-muted); margin-bottom: 8px; }
   .tracktor-check { flex-direction: row !important; align-items: center; color: var(--lumiverse-text) !important; }
   .tracktor-common-check { min-height: 30px; margin-bottom: 0 !important; }

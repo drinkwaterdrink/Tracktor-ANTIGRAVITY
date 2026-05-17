@@ -28,7 +28,9 @@
 
 ## Porting Decisions
 
-- Tracktor stores records in `message.metadata.tracktor` rather than mutating rendered chat DOM.
+- Tracktor stores full records in user storage and mirrors only `{ snapshotId, updatedAt }` in `message.metadata.tracktor`.
 - Tracktor starts with JSON and native JSON-schema modes; XML/TOON can be layered in later.
 - Auto mode runs after rendered user or assistant messages. It does not try to pause the host generation pipeline.
 - Inline UI is implemented as Lumiverse message widgets so it survives route redraws and does not depend on internal message DOM classes.
+- zTracker/WTracker Handlebars templates are supported through real Handlebars plus post-render sanitization. The simple renderer remains available as a fallback mode.
+- Prompt injection should select snapshots by chat message order, not snapshot edit time, so edited old trackers do not masquerade as the latest scene state.

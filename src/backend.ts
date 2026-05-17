@@ -40,6 +40,7 @@ import {
   sanitizeSchemaPresetMap,
   schemaPresetNeedsMigration,
   schemaToExample,
+  selectLatestSnapshotsByMessageOrder,
   settingsForStorage,
   snapshotToRecord,
   snapshotsPath,
@@ -74,6 +75,7 @@ const chatUserIds = new Map<string, string>();
 const connectionListWarnings = new Set<string>();
 const connectionStateWarnings = new Set<string>();
 const generationDiagnostics = new Set<string>();
+const inactiveSettingWarnings = new Set<string>();
 let lastFrontendUserId: string | null = null;
 let interceptorRegistered = false;
 
@@ -200,8 +202,24 @@ async function loadSettings(userId: string): Promise<TracktorSettings> {
   if (migrationNeeded) {
     await addDiagnostic(userId, 'Tracktor migrated schema presets into tracker presets with per-preset prompts and templates.');
   }
+  await warnInactiveCompatibilitySettings(userId, settings);
   await saveSettings(settings, userId);
   return settings;
+}
+
+async function warnInactiveCompatibilitySettings(userId: string, settings: TracktorSettings): Promise<void> {
+  const inactive: string[] = [];
+  if (settings.trackerPresetId) inactive.push('Lumiverse generation preset id');
+  if (settings.includeCharacterCardInTrackerPrompt) inactive.push('character card tracker context');
+  if (settings.trackerSystemPromptSource !== 'saved_tracker_prompt') inactive.push('tracker system prompt source');
+  if (settings.savedTrackerPromptId) inactive.push('saved tracker prompt id');
+  if (settings.trackerWorldBookMode !== 'include_all') inactive.push('world-book filtering');
+  if (settings.allowedWorldBookIds.length > 0 || settings.allowedWorldBookEntryIds.length > 0) inactive.push('world-book allowlists');
+  if (inactive.length === 0) return;
+  const key = `${userId}:${inactive.sort().join('|')}`;
+  if (inactiveSettingWarnings.has(key)) return;
+  inactiveSettingWarnings.add(key);
+  await addDiagnostic(userId, `Tracktor preserved future compatibility settings that are not active in this build: ${inactive.join(', ')}.`);
 }
 
 async function saveSettings(settings: TracktorSettings, userId: string, validatePresetKey?: string): Promise<TracktorSettings> {
@@ -364,6 +382,7 @@ function legacySnapshotFromMessage(chatId: string, message: ChatMessageDTO): Tra
     partsOrder: getTopLevelSchemaKeys(record.schema),
     partsMeta: {},
     pendingRedactions: record.pendingRedactions ?? {},
+    templateEngine: record.templateEngine,
     createdAt: updatedAt,
     updatedAt,
   };
@@ -688,7 +707,7 @@ function makeTrackerSnapshot(
   runtime: TrackerPresetRuntime,
   data: Record<string, unknown>,
   existing?: TrackerSnapshot,
-  options: { renderTemplate?: string } = {},
+  options: { renderTemplate?: string; templateEngine?: TemplateEngine } = {},
 ): TrackerSnapshot {
   const now = Date.now();
   return {
@@ -701,7 +720,7 @@ function makeTrackerSnapshot(
     partsOrder: getTopLevelSchemaKeys(runtime.schema),
     partsMeta: existing?.partsMeta ?? {},
     pendingRedactions: existing?.pendingRedactions ?? {},
-    templateEngine: existing?.templateEngine ?? runtime.templateEngine,
+    templateEngine: options.templateEngine ?? runtime.templateEngine,
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
   };
@@ -740,6 +759,7 @@ async function updateTrackerData(userId: string, chatId: string, messageId: stri
   const runtime = resolvePresetRuntime(settings, preset);
   const snapshot = makeTrackerSnapshot(chatId, messageId, preset, runtime, data, current, {
     renderTemplate: current?.renderTemplate || runtime.renderTemplate,
+    templateEngine: current?.templateEngine ?? runtime.templateEngine,
   });
   await assertRuntimeTemplateRenders(userId, preset, runtime, snapshot.value, snapshot.renderTemplate, snapshot.templateEngine);
   await persistTrackerSnapshot(userId, message, snapshot, settings);
@@ -766,7 +786,10 @@ async function regeneratePart(userId: string, chatId: string, messageId: string,
   const part = await requestJsonForSchema(prompt, schema, `tracktor_${partKey}`, settings, runtime, userId);
   if (!isPlainObject(part) || !(partKey in part)) throw new Error(`Part response did not include "${partKey}".`);
   const next = { ...snapshot.value, [partKey]: part[partKey] };
-  const updated = makeTrackerSnapshot(chatId, messageId, preset, runtime, next, snapshot);
+  const updated = makeTrackerSnapshot(chatId, messageId, preset, runtime, next, snapshot, {
+    renderTemplate: snapshot.renderTemplate || runtime.renderTemplate,
+    templateEngine: snapshot.templateEngine ?? runtime.templateEngine,
+  });
   await assertRuntimeTemplateRenders(userId, preset, runtime, updated.value, updated.renderTemplate, updated.templateEngine);
   await persistTrackerSnapshot(userId, message, updated, settings);
 }
@@ -1039,7 +1062,19 @@ function tryRegisterInterceptor(): void {
     }
     const settings = await loadSettings(userId);
     if (!settings.injectTrackerSnapshots || settings.trackerSnapshotCount <= 0) return messages;
-    const snapshots = (await loadSnapshots(userId, chatId)).slice(-settings.trackerSnapshotCount);
+    const allSnapshots = await loadSnapshots(userId, chatId);
+    let snapshots: TrackerSnapshot[] = [];
+    try {
+      const chatMessages = await spindle.chat.getMessages(chatId, userId) as ChatMessageDTO[];
+      snapshots = selectLatestSnapshotsByMessageOrder(chatMessages, allSnapshots, settings.trackerSnapshotCount);
+      if (snapshots.length === 0 && allSnapshots.length > 0) {
+        await addGenerationDiagnosticOnce(userId, `injection-order-empty:${chatId}`, 'Tracktor could not match saved snapshots to chat messages for prompt injection; falling back to saved snapshot order.');
+        snapshots = allSnapshots.slice(-settings.trackerSnapshotCount);
+      }
+    } catch (error) {
+      await addGenerationDiagnosticOnce(userId, `injection-order-fallback:${chatId}`, `Tracktor could not read chat message order for prompt injection; falling back to saved snapshot order: ${error instanceof Error ? error.message : String(error)}`);
+      snapshots = allSnapshots.slice(-settings.trackerSnapshotCount);
+    }
     if (snapshots.length === 0) return messages;
     const transform = settings.snapshotTransformPresets[settings.snapshotTransformPresetKey] ?? settings.snapshotTransformPresets.default_json;
     const injected = snapshots.map((snapshot) => ({

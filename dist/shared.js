@@ -1,4 +1,5 @@
-// Built-in template engine — no external dependencies.
+// Handlebars is the default template engine; the built-in renderer remains as the simple fallback.
+import Handlebars from 'handlebars';
 export const EXTENSION_ID = 'tracktor';
 export const METADATA_KEY = 'tracktor';
 export const SETTINGS_PATH = 'settings.json';
@@ -392,6 +393,19 @@ export function getTopLevelSchemaKeys(schema) {
         return [];
     return Object.keys(properties);
 }
+export function selectLatestSnapshotsByMessageOrder(messages, snapshots, limit) {
+    if (limit <= 0 || snapshots.length === 0)
+        return [];
+    const messageIndex = new Map(messages.map((message, index) => [message.id, index]));
+    return snapshots
+        .filter((snapshot) => messageIndex.has(snapshot.messageId))
+        .sort((a, b) => {
+        const left = messageIndex.get(a.messageId) ?? 0;
+        const right = messageIndex.get(b.messageId) ?? 0;
+        return left - right;
+    })
+        .slice(-limit);
+}
 export function buildTopLevelPartSchema(schema, key) {
     const properties = isPlainObject(schema.properties) ? schema.properties : {};
     const property = properties[key];
@@ -435,8 +449,11 @@ export function schemaToExample(schema) {
 }
 export function renderTrackerTemplate(templateHtml, data, options = {}) {
     const sanitizedTemplate = stripDangerousHtml(templateHtml);
+    const templateEngine = options.templateEngine ?? 'handlebars';
     try {
-        const rendered = renderBuiltinTemplate(sanitizedTemplate, data, data);
+        const rendered = templateEngine === 'simple'
+            ? renderBuiltinTemplate(sanitizedTemplate, data, data)
+            : renderHandlebarsTemplate(sanitizedTemplate, data, options.onWarning);
         return stripDangerousHtml(rendered);
     }
     catch (error) {
@@ -642,6 +659,44 @@ function sanitizeInteger(value, fallback, min, max) {
     if (!Number.isFinite(parsed))
         return fallback;
     return Math.min(max, Math.max(min, Math.floor(parsed)));
+}
+const handlebarsRuntime = createHandlebarsRuntime();
+function createHandlebarsRuntime() {
+    try {
+        const runtime = Handlebars.create();
+        runtime.registerHelper('join', (value, separator) => {
+            if (!Array.isArray(value))
+                return '';
+            const delimiter = typeof separator === 'string' ? separator : ', ';
+            return value.map((item) => {
+                if (item == null)
+                    return '';
+                return typeof item === 'object' ? JSON.stringify(item) : String(item);
+            }).join(delimiter);
+        });
+        runtime.registerHelper('json', (value) => JSON.stringify(value, null, 2));
+        return runtime;
+    }
+    catch {
+        return null;
+    }
+}
+function renderHandlebarsTemplate(template, data, onWarning) {
+    if (!handlebarsRuntime) {
+        onWarning?.('Handlebars runtime was unavailable; falling back to the simple template renderer.');
+        return renderBuiltinTemplate(template, data, data);
+    }
+    const compiled = handlebarsRuntime.compile(template, {
+        noEscape: false,
+        strict: false,
+    });
+    const context = isPlainObject(data)
+        ? { ...data, data }
+        : { data };
+    return compiled(context, {
+        allowProtoMethodsByDefault: false,
+        allowProtoPropertiesByDefault: false,
+    });
 }
 /**
  * Built-in safe template engine that handles the Handlebars subset used by

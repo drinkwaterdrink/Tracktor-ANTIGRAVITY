@@ -1,4 +1,6 @@
-// Built-in template engine — no external dependencies.
+// Handlebars is the default template engine; the built-in renderer remains as the simple fallback.
+
+import Handlebars from 'handlebars';
 
 export const EXTENSION_ID = 'tracktor';
 export const METADATA_KEY = 'tracktor';
@@ -641,6 +643,23 @@ export function getTopLevelSchemaKeys(schema: Record<string, unknown>): string[]
   return Object.keys(properties);
 }
 
+export function selectLatestSnapshotsByMessageOrder(
+  messages: Array<{ id: string }>,
+  snapshots: TrackerSnapshot[],
+  limit: number,
+): TrackerSnapshot[] {
+  if (limit <= 0 || snapshots.length === 0) return [];
+  const messageIndex = new Map(messages.map((message, index) => [message.id, index]));
+  return snapshots
+    .filter((snapshot) => messageIndex.has(snapshot.messageId))
+    .sort((a, b) => {
+      const left = messageIndex.get(a.messageId) ?? 0;
+      const right = messageIndex.get(b.messageId) ?? 0;
+      return left - right;
+    })
+    .slice(-limit);
+}
+
 export function buildTopLevelPartSchema(schema: Record<string, unknown>, key: string): Record<string, unknown> {
   const properties = isPlainObject(schema.properties) ? schema.properties as Record<string, unknown> : {};
   const property = properties[key];
@@ -686,8 +705,11 @@ export function renderTrackerTemplate(
   options: { templateEngine?: TemplateEngine; onWarning?: (message: string) => void } = {},
 ): string {
   const sanitizedTemplate = stripDangerousHtml(templateHtml);
+  const templateEngine = options.templateEngine ?? 'handlebars';
   try {
-    const rendered = renderBuiltinTemplate(sanitizedTemplate, data, data);
+    const rendered = templateEngine === 'simple'
+      ? renderBuiltinTemplate(sanitizedTemplate, data, data)
+      : renderHandlebarsTemplate(sanitizedTemplate, data, options.onWarning);
     return stripDangerousHtml(rendered);
   } catch (error) {
     options.onWarning?.(`Template rendering failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -917,6 +939,44 @@ function sanitizeInteger(value: unknown, fallback: number, min: number, max: num
   const parsed = typeof value === 'number' ? value : Number.parseInt(String(value), 10);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.min(max, Math.max(min, Math.floor(parsed)));
+}
+
+const handlebarsRuntime = createHandlebarsRuntime();
+
+function createHandlebarsRuntime(): ReturnType<typeof Handlebars.create> | null {
+  try {
+    const runtime = Handlebars.create();
+    runtime.registerHelper('join', (value: unknown, separator: unknown) => {
+      if (!Array.isArray(value)) return '';
+      const delimiter = typeof separator === 'string' ? separator : ', ';
+      return value.map((item) => {
+        if (item == null) return '';
+        return typeof item === 'object' ? JSON.stringify(item) : String(item);
+      }).join(delimiter);
+    });
+    runtime.registerHelper('json', (value: unknown) => JSON.stringify(value, null, 2));
+    return runtime;
+  } catch {
+    return null;
+  }
+}
+
+function renderHandlebarsTemplate(template: string, data: unknown, onWarning?: (message: string) => void): string {
+  if (!handlebarsRuntime) {
+    onWarning?.('Handlebars runtime was unavailable; falling back to the simple template renderer.');
+    return renderBuiltinTemplate(template, data, data);
+  }
+  const compiled = handlebarsRuntime.compile(template, {
+    noEscape: false,
+    strict: false,
+  });
+  const context = isPlainObject(data)
+    ? { ...data, data }
+    : { data };
+  return compiled(context, {
+    allowProtoMethodsByDefault: false,
+    allowProtoPropertiesByDefault: false,
+  });
 }
 
 /**

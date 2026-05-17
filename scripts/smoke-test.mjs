@@ -1,5 +1,10 @@
 import { parseJsonTrackerResponse } from '../dist/parser.js';
-import { DEFAULT_TEMPLATE_HTML, renderTrackerTemplate, stripDangerousHtml } from '../dist/shared.js';
+import {
+  DEFAULT_TEMPLATE_HTML,
+  renderTrackerTemplate,
+  selectLatestSnapshotsByMessageOrder,
+  stripDangerousHtml,
+} from '../dist/shared.js';
 
 const parsed = parseJsonTrackerResponse('```json\n{"time":"noon",}\n```');
 if (parsed.data.time !== 'noon') {
@@ -91,6 +96,26 @@ if (falseSectionHtml.includes('hidden')) {
 
 if (stripDangerousHtml('<iframe src="x"></iframe><b>ok</b>') !== '<b>ok</b>') {
   throw new Error('iframe sanitizer failed');
+}
+
+const rawHtml = renderTrackerTemplate('{{{data.raw}}}', {
+  raw: '<span onclick="bad()">safe text</span><script>bad()</script>',
+}, { templateEngine: 'handlebars' });
+if (rawHtml.includes('onclick') || rawHtml.includes('<script') || !rawHtml.includes('safe text')) {
+  throw new Error('triple-stash sanitizer failed');
+}
+
+const orderedSnapshots = selectLatestSnapshotsByMessageOrder(
+  [{ id: 'm1' }, { id: 'm2' }, { id: 'm3' }, { id: 'm4' }],
+  [
+    { messageId: 'm4', updatedAt: 10, id: 's4', chatId: 'c', schemaPresetKey: 'scene', value: {}, renderTemplate: '', partsOrder: [], partsMeta: {}, pendingRedactions: {}, createdAt: 10 },
+    { messageId: 'm1', updatedAt: 999, id: 's1', chatId: 'c', schemaPresetKey: 'scene', value: {}, renderTemplate: '', partsOrder: [], partsMeta: {}, pendingRedactions: {}, createdAt: 1 },
+    { messageId: 'm3', updatedAt: 20, id: 's3', chatId: 'c', schemaPresetKey: 'scene', value: {}, renderTemplate: '', partsOrder: [], partsMeta: {}, pendingRedactions: {}, createdAt: 20 },
+  ],
+  2,
+);
+if (orderedSnapshots.map((snapshot) => snapshot.messageId).join(',') !== 'm3,m4') {
+  throw new Error('snapshot message-order selection failed');
 }
 
 console.log('smoke ok');
