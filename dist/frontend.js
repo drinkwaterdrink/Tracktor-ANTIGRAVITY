@@ -6,28 +6,20 @@ const widgetCleanups = new Map();
 export function setup(ctx) {
     ctxRef = ctx;
     const removeStyle = ctx.dom.addStyle(STYLES);
-    const tab = ctx.ui.registerDrawerTab({
-        id: 'tracktor',
-        title: 'Tracktor',
-        shortName: 'Track',
-        headerTitle: 'Tracktor',
-        description: 'Generate and manage structured chat trackers',
-        keywords: ['tracker', 'state', 'schema', 'ztracker'],
-        iconSvg: TRACKTOR_ICON,
-    });
-    root = tab.root;
+    const placement = createPlacement(ctx);
+    root = placement.root;
     root.classList.add('tracktor-root');
-    const openAction = ctx.ui.registerInputBarAction?.({
+    const openAction = ctx.ui?.registerInputBarAction?.({
         id: 'open-tracktor',
         label: 'Open Tracktor',
         enabled: true,
         iconSvg: TRACKTOR_SMALL_ICON,
     });
     const unbindOpenAction = openAction?.onClick(() => {
-        tab.activate();
+        placement.activate();
         ctx.sendToBackend({ type: 'get_state' });
     });
-    const inputAction = ctx.ui.registerInputBarAction?.({
+    const inputAction = ctx.ui?.registerInputBarAction?.({
         id: 'generate-latest-tracker',
         label: 'Generate Latest Tracker',
         enabled: true,
@@ -35,17 +27,17 @@ export function setup(ctx) {
     });
     const unbindInputAction = inputAction?.onClick(() => {
         ctx.sendToBackend({ type: 'generate_tracker' });
-        tab.activate();
+        placement.activate();
     });
     const unbindBackend = ctx.onBackendMessage((payload) => {
         if (payload?.type === 'state') {
             state = payload.state;
-            tab.setBadge(state?.activeChat?.trackers.length ? String(state.activeChat.trackers.length) : null);
+            placement.setBadge(state?.activeChat?.trackers.length ? String(state.activeChat.trackers.length) : null);
             render();
             renderMessageWidgets();
         }
     });
-    const unbindActivate = tab.onActivate(() => {
+    const unbindActivate = placement.onActivate(() => {
         ctx.sendToBackend({ type: 'get_state' });
     });
     root.addEventListener('click', handleClick);
@@ -65,10 +57,142 @@ export function setup(ctx) {
         openAction?.destroy();
         unbindActivate();
         unbindBackend();
-        tab.destroy();
+        placement.destroy();
         removeStyle();
         ctx.dom.cleanup();
     };
+}
+function createPlacement(ctx) {
+    const drawerTab = tryCreateDrawerTab(ctx);
+    if (drawerTab) {
+        const cleanupLauncher = createFloatingLauncher(ctx, () => drawerTab.activate());
+        return {
+            root: drawerTab.root,
+            activate: drawerTab.activate,
+            setBadge(text) {
+                drawerTab.setBadge(text);
+                cleanupLauncher.setBadge(text);
+            },
+            onActivate: drawerTab.onActivate,
+            destroy() {
+                cleanupLauncher.destroy();
+                drawerTab.destroy();
+            },
+        };
+    }
+    return createFallbackPanel(ctx);
+}
+function tryCreateDrawerTab(ctx) {
+    if (typeof ctx.ui?.registerDrawerTab !== 'function') {
+        return undefined;
+    }
+    try {
+        const tab = ctx.ui.registerDrawerTab({
+            id: 'tracktor',
+            title: 'Tracktor',
+            shortName: 'Track',
+            headerTitle: 'Tracktor',
+            description: 'Generate and manage structured chat trackers',
+            keywords: ['tracker', 'state', 'schema', 'ztracker'],
+            iconSvg: TRACKTOR_ICON,
+        });
+        return {
+            root: tab.root,
+            activate: () => tab.activate(),
+            setBadge: (text) => tab.setBadge(text),
+            onActivate: (handler) => tab.onActivate(handler),
+            destroy: () => tab.destroy(),
+        };
+    }
+    catch (error) {
+        console.warn('Tracktor: drawer tab registration failed, falling back to a fixed launcher panel.', error);
+        return undefined;
+    }
+}
+function createFloatingLauncher(ctx, activate) {
+    const launcher = injectHostElement(ctx, 'body', `<button type="button" class="tracktor-floating-launcher" title="Open Tracktor">${TRACKTOR_SMALL_ICON}<span>Tracktor</span></button>`);
+    const button = launcher.matches('.tracktor-floating-launcher')
+        ? launcher
+        : launcher.querySelector('.tracktor-floating-launcher');
+    const onClick = () => {
+        activate();
+        ctx.sendToBackend({ type: 'get_state' });
+    };
+    button?.addEventListener('click', onClick);
+    return {
+        setBadge(text) {
+            if (!button)
+                return;
+            button.setAttribute('data-tracktor-badge', text ?? '');
+            button.classList.toggle('has-tracktor-badge', !!text);
+        },
+        destroy() {
+            button?.removeEventListener('click', onClick);
+            launcher.remove();
+        },
+    };
+}
+function createFallbackPanel(ctx) {
+    const shell = injectHostElement(ctx, 'body', `
+      <div class="tracktor-fallback-shell">
+        <button type="button" class="tracktor-floating-launcher" title="Open Tracktor">${TRACKTOR_SMALL_ICON}<span>Tracktor</span></button>
+        <aside class="tracktor-fallback-panel" aria-hidden="true">
+          <div class="tracktor-fallback-header">
+            <strong>Tracktor</strong>
+            <button type="button" class="tracktor-fallback-close" title="Close Tracktor">Close</button>
+          </div>
+          <div class="tracktor-fallback-body"></div>
+        </aside>
+      </div>
+    `);
+    const body = shell.querySelector('.tracktor-fallback-body');
+    const launcher = shell.querySelector('.tracktor-floating-launcher');
+    const close = shell.querySelector('.tracktor-fallback-close');
+    if (!body) {
+        throw new Error('Tracktor fallback panel failed to mount.');
+    }
+    const activateHandlers = new Set();
+    const activate = () => {
+        shell.classList.add('is-open');
+        shell.querySelector('.tracktor-fallback-panel')?.setAttribute('aria-hidden', 'false');
+        activateHandlers.forEach((handler) => handler());
+    };
+    const deactivate = () => {
+        shell.classList.remove('is-open');
+        shell.querySelector('.tracktor-fallback-panel')?.setAttribute('aria-hidden', 'true');
+    };
+    launcher?.addEventListener('click', activate);
+    close?.addEventListener('click', deactivate);
+    return {
+        root: body,
+        activate,
+        setBadge(text) {
+            launcher?.setAttribute('data-tracktor-badge', text ?? '');
+            launcher?.classList.toggle('has-tracktor-badge', !!text);
+        },
+        onActivate(handler) {
+            activateHandlers.add(handler);
+            return () => activateHandlers.delete(handler);
+        },
+        destroy() {
+            launcher?.removeEventListener('click', activate);
+            close?.removeEventListener('click', deactivate);
+            shell.remove();
+        },
+    };
+}
+function injectHostElement(ctx, target, html) {
+    if (typeof ctx.dom.inject === 'function') {
+        return ctx.dom.inject(target, html);
+    }
+    const template = document.createElement('template');
+    template.innerHTML = html.trim();
+    const element = template.content.firstElementChild;
+    if (!element) {
+        throw new Error('Tracktor failed to create host element.');
+    }
+    document.querySelector(target)?.appendChild(element);
+    return element;
 }
 function render() {
     if (!root)
@@ -347,6 +471,19 @@ function openEditModal(chatId, messageId) {
     const tracker = state.activeChat?.trackers.find((item) => item.chatId === chatId && item.messageId === messageId);
     if (!tracker)
         return;
+    if (typeof ctxRef.ui?.showModal !== 'function') {
+        const next = window.prompt('Edit tracker JSON', JSON.stringify(tracker.tracker.data, null, 2));
+        if (next === null)
+            return;
+        try {
+            JSON.parse(next);
+            ctxRef.sendToBackend({ type: 'update_tracker', chatId, messageId, data: next });
+        }
+        catch (error) {
+            showErrorModal(error instanceof Error ? error.message : String(error));
+        }
+        return;
+    }
     const modal = ctxRef.ui.showModal({ title: 'Edit Tracker JSON', width: 720, maxHeight: 720 });
     modal.root.innerHTML = `
     <div class="tracktor-modal-body">
@@ -381,17 +518,23 @@ function openEditModal(chatId, messageId) {
 async function confirmDelete(chatId, messageId) {
     if (!chatId || !messageId)
         return;
-    const { confirmed } = await ctxRef.ui.showConfirm({
-        title: 'Delete Tracker',
-        message: 'Delete tracker data from this message?',
-        variant: 'danger',
-        confirmLabel: 'Delete',
-    });
+    const { confirmed } = typeof ctxRef.ui?.showConfirm === 'function'
+        ? await ctxRef.ui.showConfirm({
+            title: 'Delete Tracker',
+            message: 'Delete tracker data from this message?',
+            variant: 'danger',
+            confirmLabel: 'Delete',
+        })
+        : { confirmed: window.confirm('Delete tracker data from this message?') };
     if (confirmed) {
         ctxRef.sendToBackend({ type: 'delete_tracker', chatId, messageId });
     }
 }
 function showErrorModal(message) {
+    if (typeof ctxRef.ui?.showModal !== 'function') {
+        window.alert(`Tracktor Error: ${message}`);
+        return;
+    }
     const modal = ctxRef.ui.showModal({ title: 'Tracktor Error', width: 420, maxHeight: 320 });
     modal.root.innerHTML = `<p class="tracktor-error-text">${escapeHtml(message)}</p>`;
 }
@@ -478,6 +621,73 @@ const TRACKTOR_ICON = '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidd
 const TRACKTOR_SMALL_ICON = '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M4 5h11a3 3 0 0 1 3 3v1h1.2a2 2 0 0 1 1.8 1.1l1 2V17h-2.1a3 3 0 0 1-5.8 0H10a3 3 0 0 1-5.8 0H2V7a2 2 0 0 1 2-2Z"/></svg>';
 const STYLES = `
   .tracktor-root { height: 100%; overflow: auto; color: var(--lumiverse-text); }
+  .tracktor-floating-launcher {
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    z-index: 2147483000;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border: 1px solid var(--lumiverse-border, #444);
+    background: var(--lumiverse-fill-subtle, #202020);
+    color: var(--lumiverse-text, #fff);
+    border-radius: 999px;
+    padding: 8px 11px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, .24);
+    cursor: pointer;
+    font: 12px/1 system-ui, sans-serif;
+  }
+  .tracktor-floating-launcher:hover { border-color: var(--lumiverse-border-hover, #777); }
+  .tracktor-floating-launcher.has-tracktor-badge::after {
+    content: attr(data-tracktor-badge);
+    min-width: 16px;
+    height: 16px;
+    border-radius: 999px;
+    display: inline-grid;
+    place-items: center;
+    padding: 0 4px;
+    background: var(--lumiverse-accent, #58a6ff);
+    color: var(--lumiverse-accent-fg, #fff);
+    font-size: 10px;
+    font-weight: 700;
+  }
+  .tracktor-fallback-panel {
+    position: fixed;
+    right: 16px;
+    bottom: 58px;
+    z-index: 2147482999;
+    width: min(560px, calc(100vw - 24px));
+    max-height: min(760px, calc(100vh - 84px));
+    display: none;
+    flex-direction: column;
+    overflow: hidden;
+    border: 1px solid var(--lumiverse-border, #444);
+    background: var(--lumiverse-fill, #161616);
+    color: var(--lumiverse-text, #fff);
+    border-radius: 10px;
+    box-shadow: 0 18px 48px rgba(0, 0, 0, .35);
+  }
+  .tracktor-fallback-shell.is-open .tracktor-fallback-panel { display: flex; }
+  .tracktor-fallback-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 10px;
+    border-bottom: 1px solid var(--lumiverse-border, #444);
+  }
+  .tracktor-fallback-close {
+    border: 1px solid var(--lumiverse-border, #444);
+    background: var(--lumiverse-fill-subtle, #202020);
+    color: inherit;
+    border-radius: 6px;
+    padding: 5px 8px;
+    cursor: pointer;
+  }
+  .tracktor-fallback-body {
+    overflow: auto;
+  }
   .tracktor-shell { display: flex; flex-direction: column; gap: 10px; padding: 10px; }
   .tracktor-section { border-top: 1px solid var(--lumiverse-border); padding-top: 10px; }
   .tracktor-section:first-child { border-top: 0; padding-top: 0; }
