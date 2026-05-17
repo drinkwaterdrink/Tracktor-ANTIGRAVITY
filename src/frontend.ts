@@ -107,7 +107,7 @@ export function setup(ctx: SpindleFrontendContext) {
     iconSvg: TRACKTOR_SMALL_ICON,
   });
   const unbindGenerateAction = generateAction?.onClick(() => {
-    sendBackend({ type: 'generate_tracker' });
+    generateLatestTracker();
   });
 
   const toggleInjectionAction = ctx.ui?.registerInputBarAction?.({
@@ -132,7 +132,7 @@ export function setup(ctx: SpindleFrontendContext) {
     btn.addEventListener('click', () => {
       const action = btn.getAttribute('data-action');
       if (action === 'generate_tracker') {
-        sendBackend({ type: 'generate_tracker' });
+        generateLatestTracker();
       } else if (action === 'cancel_job') {
         sendBackend({ type: 'cancel_job', jobId: btn.getAttribute('data-job-id') ?? undefined });
       }
@@ -172,7 +172,7 @@ export function setup(ctx: SpindleFrontendContext) {
         domToolbarActionElement.classList.remove('tracktor-dom-busy');
         domToolbarActionElement.setAttribute('data-action', 'generate_tracker');
         domToolbarActionElement.removeAttribute('data-job-id');
-        domToolbarActionElement.innerHTML = `${TRACKTOR_SMALL_ICON}<span class="tracktor-dom-label">Tracktor</span>`;
+        domToolbarActionElement.innerHTML = TRACKTOR_SMALL_ICON;
         domToolbarActionElement.title = 'Generate Latest Tracker';
         domToolbarActionElement.setAttribute('aria-label', 'Generate latest Tracktor tracker');
       }
@@ -293,6 +293,15 @@ function sendBackend(payload: Record<string, unknown>): void {
     return;
   }
   ctxRef.sendToBackend(payload);
+}
+
+function generateLatestTracker(sequential = false): void {
+  const chatId = state?.activeChat?.id ?? getActiveChatId();
+  sendBackend({
+    type: 'generate_tracker',
+    ...(chatId ? { chatId } : {}),
+    ...(sequential ? { sequential: true } : {}),
+  });
 }
 
 function getActiveChatId(): string | undefined {
@@ -1013,9 +1022,9 @@ function handleClick(event: Event): void {
   } else if (!state) {
     return;
   } else if (action === 'generate-latest') {
-    sendBackend({ type: 'generate_tracker', chatId: state.activeChat?.id });
+    generateLatestTracker();
   } else if (action === 'generate-latest-sequential') {
-    sendBackend({ type: 'generate_tracker', chatId: state.activeChat?.id, sequential: true });
+    generateLatestTracker(true);
   } else if (action === 'copy-latest') {
     void copyLatestSnapshot();
   } else if (action === 'regenerate') {
@@ -2171,12 +2180,12 @@ const STYLES = `
     align-items: center;
     justify-content: center;
     min-width: 0;
+    width: 38px;
     height: 38px;
     border-radius: 20px;
-    padding: 0 12px;
+    padding: 0;
     margin: 0 4px;
     transition: all 0.2s ease;
-    gap: 6px;
     box-sizing: border-box;
   }
   .tracktor-dom-toolbar-btn:hover {
@@ -2191,11 +2200,6 @@ const STYLES = `
     width: 16px;
     height: 16px;
     flex: 0 0 auto;
-  }
-  .tracktor-dom-label {
-    font-size: 13px;
-    font-weight: 650;
-    white-space: nowrap;
   }
   .tracktor-dom-progress-text {
     font-size: 13px;
