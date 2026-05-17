@@ -3,7 +3,7 @@ export const METADATA_KEY = 'tracktor';
 export const SETTINGS_PATH = 'settings.json';
 export const SCHEMA_PRESETS_PATH = 'schema-presets.json';
 export const DIAGNOSTICS_PATH = 'diagnostics/latest.json';
-export const VERSION = '0.2.0';
+export const VERSION = '0.3.0';
 
 export type MessageRole = 'system' | 'user' | 'assistant';
 export type TrackerAutoMode = 'none' | 'responses' | 'inputs' | 'both';
@@ -16,6 +16,13 @@ export interface LlmMessageDTO {
   role: MessageRole;
   content: string;
   name?: string;
+}
+
+export interface ConnectionOption {
+  id: string;
+  name: string;
+  provider?: string;
+  model?: string;
 }
 
 export interface ChatMessageDTO {
@@ -39,9 +46,18 @@ export interface SchemaPreset {
   jsonSchema: Record<string, unknown>;
   templateHtml: string;
   renderTemplate: string;
+  systemPrompt: string;
+  extractionPrompt: string;
+  trackerInstructionPrompt: string;
+  jsonPromptTemplate: string;
+  xmlPromptTemplate: string;
+  toonPromptTemplate: string;
+  structuredOutputMode?: StructuredOutputMode;
   createdAt: number;
   updatedAt: number;
 }
+
+export type TrackerPreset = SchemaPreset;
 
 export interface TrackerSnapshot {
   id: string;
@@ -107,6 +123,7 @@ export interface LegacyInjectionSettings {
 export interface TracktorSettings {
   version: string;
   schemaPresets: Record<string, SchemaPreset>;
+  activeTrackerPresetKey: string;
   activeSchemaPresetKey: string;
   activeSchemaId: string;
   trackerConnectionId: string | null;
@@ -180,6 +197,7 @@ export interface TrackerJobState {
 
 export interface FrontendState {
   settings: TracktorSettings;
+  availableConnections: ConnectionOption[];
   activeChat: ActiveChatState | null;
   permissionWarnings: string[];
   busy: boolean;
@@ -299,6 +317,12 @@ export const defaultSchemaPresets: Record<string, SchemaPreset> = {
     schema: DEFAULT_SCHEMA,
     renderTemplate: DEFAULT_TEMPLATE_HTML,
     templateHtml: DEFAULT_TEMPLATE_HTML,
+    systemPrompt: DEFAULT_SYSTEM_PROMPT,
+    extractionPrompt: DEFAULT_EXTRACTION_PROMPT,
+    trackerInstructionPrompt: DEFAULT_EXTRACTION_PROMPT,
+    jsonPromptTemplate: DEFAULT_JSON_PROMPT_TEMPLATE,
+    xmlPromptTemplate: DEFAULT_XML_PROMPT_TEMPLATE,
+    toonPromptTemplate: DEFAULT_TOON_PROMPT_TEMPLATE,
   }, 'scene'),
 };
 
@@ -338,6 +362,7 @@ export const defaultSnapshotTransformPresets: Record<string, SnapshotTransformPr
 export const defaultSettings: TracktorSettings = {
   version: VERSION,
   schemaPresets: structuredClone(defaultSchemaPresets),
+  activeTrackerPresetKey: 'scene',
   activeSchemaPresetKey: 'scene',
   activeSchemaId: 'scene',
   trackerConnectionId: null,
@@ -414,9 +439,15 @@ export function deepMergeSettings(input: unknown, schemaPresets?: Record<string,
     'debugLogging',
   ]);
 
-  merged.schemaPresets = sanitizeSchemaPresetMap(schemaPresets ?? saved.schemaPresets);
-  merged.activeSchemaPresetKey = sanitizeId(readString(saved.activeSchemaPresetKey) || readString(saved.activeSchemaId) || merged.activeSchemaPresetKey) || 'scene';
-  merged.activeSchemaId = merged.activeSchemaPresetKey;
+  merged.schemaPresets = sanitizeSchemaPresetMap(schemaPresets ?? saved.schemaPresets, merged);
+  merged.activeTrackerPresetKey = sanitizeId(
+    readString(saved.activeTrackerPresetKey)
+      || readString(saved.activeSchemaPresetKey)
+      || readString(saved.activeSchemaId)
+      || merged.activeTrackerPresetKey,
+  ) || 'scene';
+  merged.activeSchemaPresetKey = merged.activeTrackerPresetKey;
+  merged.activeSchemaId = merged.activeTrackerPresetKey;
 
   merged.autoMode = normalizeAutoMode(saved.autoMode);
   merged.sequentialGeneration = readBool(saved.sequentialGeneration, readBool(saved.sequentialPartGeneration, merged.sequentialGeneration));
@@ -475,12 +506,14 @@ export function deepMergeSettings(input: unknown, schemaPresets?: Record<string,
   merged.trackerInstructionPrompt = merged.trackerInstructionPrompt || merged.extractionPrompt || DEFAULT_EXTRACTION_PROMPT;
   merged.extractionPrompt = merged.trackerInstructionPrompt;
 
-  if (!merged.schemaPresets[merged.activeSchemaPresetKey]) {
-    merged.activeSchemaPresetKey = Object.keys(merged.schemaPresets)[0] ?? 'scene';
-    merged.activeSchemaId = merged.activeSchemaPresetKey;
+  if (!merged.schemaPresets[merged.activeTrackerPresetKey]) {
+    merged.activeTrackerPresetKey = Object.keys(merged.schemaPresets)[0] ?? 'scene';
+    merged.activeSchemaPresetKey = merged.activeTrackerPresetKey;
+    merged.activeSchemaId = merged.activeTrackerPresetKey;
   }
-  if (!merged.schemaPresets[merged.activeSchemaPresetKey]) {
+  if (!merged.schemaPresets[merged.activeTrackerPresetKey]) {
     merged.schemaPresets = structuredClone(defaultSchemaPresets);
+    merged.activeTrackerPresetKey = 'scene';
     merged.activeSchemaPresetKey = 'scene';
     merged.activeSchemaId = 'scene';
   }
@@ -500,18 +533,32 @@ export function settingsForStorage(settings: TracktorSettings): Record<string, u
   return copy;
 }
 
-export function sanitizeSchemaPresetMap(input: unknown): Record<string, SchemaPreset> {
+type PresetPromptDefaults = Partial<Pick<
+  TracktorSettings,
+  | 'systemPrompt'
+  | 'extractionPrompt'
+  | 'trackerInstructionPrompt'
+  | 'jsonPromptTemplate'
+  | 'xmlPromptTemplate'
+  | 'toonPromptTemplate'
+>>;
+
+export function sanitizeSchemaPresetMap(input: unknown, promptDefaults: PresetPromptDefaults = defaultSettings): Record<string, SchemaPreset> {
   if (!isPlainObject(input)) return structuredClone(defaultSchemaPresets);
   const out: Record<string, SchemaPreset> = {};
   for (const [fallbackKey, value] of Object.entries(input)) {
     if (!isPlainObject(value)) continue;
-    const preset = normalizeSchemaPreset(value, fallbackKey);
+    const preset = normalizeSchemaPreset(value, fallbackKey, promptDefaults);
     if (preset) out[preset.key] = preset;
   }
   return Object.keys(out).length > 0 ? out : structuredClone(defaultSchemaPresets);
 }
 
-export function normalizeSchemaPreset(input: unknown, fallbackKey = 'schema'): SchemaPreset {
+export function normalizeSchemaPreset(
+  input: unknown,
+  fallbackKey = 'schema',
+  promptDefaults: PresetPromptDefaults = {},
+): SchemaPreset {
   const value = isPlainObject(input) ? input : {};
   const key = sanitizeId(readString(value.key) || readString(value.id) || fallbackKey) || sanitizeId(fallbackKey) || 'schema';
   const schema = isPlainObject(value.jsonSchema)
@@ -520,8 +567,14 @@ export function normalizeSchemaPreset(input: unknown, fallbackKey = 'schema'): S
       ? value.schema
       : DEFAULT_SCHEMA;
   const template = readString(value.renderTemplate) || readString(value.templateHtml) || DEFAULT_TEMPLATE_HTML;
+  const systemPrompt = readString(value.systemPrompt) || readString(promptDefaults.systemPrompt) || DEFAULT_SYSTEM_PROMPT;
+  const trackerInstructionPrompt = readString(value.trackerInstructionPrompt)
+    || readString(value.extractionPrompt)
+    || readString(promptDefaults.trackerInstructionPrompt)
+    || readString(promptDefaults.extractionPrompt)
+    || DEFAULT_EXTRACTION_PROMPT;
   const now = Date.now();
-  return {
+  const preset: SchemaPreset = {
     id: key,
     key,
     name: readString(value.name) || key,
@@ -530,13 +583,39 @@ export function normalizeSchemaPreset(input: unknown, fallbackKey = 'schema'): S
     jsonSchema: schema as Record<string, unknown>,
     templateHtml: template,
     renderTemplate: template,
+    systemPrompt,
+    extractionPrompt: trackerInstructionPrompt,
+    trackerInstructionPrompt,
+    jsonPromptTemplate: readString(value.jsonPromptTemplate) || readString(promptDefaults.jsonPromptTemplate) || DEFAULT_JSON_PROMPT_TEMPLATE,
+    xmlPromptTemplate: readString(value.xmlPromptTemplate) || readString(promptDefaults.xmlPromptTemplate) || DEFAULT_XML_PROMPT_TEMPLATE,
+    toonPromptTemplate: readString(value.toonPromptTemplate) || readString(promptDefaults.toonPromptTemplate) || DEFAULT_TOON_PROMPT_TEMPLATE,
     createdAt: sanitizeInteger(value.createdAt, now, 0, Number.MAX_SAFE_INTEGER),
     updatedAt: sanitizeInteger(value.updatedAt, now, 0, Number.MAX_SAFE_INTEGER),
   };
+  const outputMode = normalizeOptionalStructuredOutputMode(value.structuredOutputMode);
+  if (outputMode) preset.structuredOutputMode = outputMode;
+  return preset;
+}
+
+export function schemaPresetNeedsMigration(input: unknown): boolean {
+  if (!isPlainObject(input)) return false;
+  const requiredFields = [
+    'systemPrompt',
+    'trackerInstructionPrompt',
+    'jsonPromptTemplate',
+    'xmlPromptTemplate',
+    'toonPromptTemplate',
+  ];
+  return Object.values(input).some((value) => (
+    isPlainObject(value)
+      && requiredFields.some((field) => typeof value[field] !== 'string' || !value[field])
+  ));
 }
 
 export function getSchemaPreset(settings: TracktorSettings, preferredId?: string): SchemaPreset {
-  const key = preferredId && settings.schemaPresets[preferredId] ? preferredId : settings.activeSchemaPresetKey;
+  const key = preferredId && settings.schemaPresets[preferredId]
+    ? preferredId
+    : settings.activeTrackerPresetKey || settings.activeSchemaPresetKey;
   return settings.schemaPresets[key] ?? settings.schemaPresets[Object.keys(settings.schemaPresets)[0]];
 }
 
@@ -729,6 +808,11 @@ function normalizeStructuredOutputMode(value: unknown): StructuredOutputMode {
   if (value === 'native_json') return 'native_json_schema';
   if (value === 'json') return 'json_prompt';
   return normalizeEnum(value, ['native_json_schema', 'json_prompt', 'xml_prompt', 'toon_prompt'], 'json_prompt');
+}
+
+function normalizeOptionalStructuredOutputMode(value: unknown): StructuredOutputMode | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  return normalizeStructuredOutputMode(value);
 }
 
 function normalizeEnum<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {

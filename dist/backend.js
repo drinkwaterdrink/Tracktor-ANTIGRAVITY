@@ -3,7 +3,7 @@ var METADATA_KEY = "tracktor";
 var SETTINGS_PATH = "settings.json";
 var SCHEMA_PRESETS_PATH = "schema-presets.json";
 var DIAGNOSTICS_PATH = "diagnostics/latest.json";
-var VERSION = "0.2.0";
+var VERSION = "0.3.0";
 var DEFAULT_SYSTEM_PROMPT = `You are a structured tracker extraction assistant. Analyze the conversation and return only tracker data that matches the requested schema. Do not roleplay, continue the scene, explain yourself, or include markdown unless the tracker format instructions explicitly ask for it. Preserve continuity with previous tracker snapshots, but update the tracker from the newest chat evidence.`;
 var DEFAULT_EXTRACTION_PROMPT = `Create a complete tracker update for the target message. Fill every required field. If a field is not explicitly stated, infer a short, reasonable value from the conversation context. Keep values concise and concrete.`;
 var DEFAULT_JSON_PROMPT_TEMPLATE = [
@@ -107,7 +107,13 @@ var defaultSchemaPresets = {
     jsonSchema: DEFAULT_SCHEMA,
     schema: DEFAULT_SCHEMA,
     renderTemplate: DEFAULT_TEMPLATE_HTML,
-    templateHtml: DEFAULT_TEMPLATE_HTML
+    templateHtml: DEFAULT_TEMPLATE_HTML,
+    systemPrompt: DEFAULT_SYSTEM_PROMPT,
+    extractionPrompt: DEFAULT_EXTRACTION_PROMPT,
+    trackerInstructionPrompt: DEFAULT_EXTRACTION_PROMPT,
+    jsonPromptTemplate: DEFAULT_JSON_PROMPT_TEMPLATE,
+    xmlPromptTemplate: DEFAULT_XML_PROMPT_TEMPLATE,
+    toonPromptTemplate: DEFAULT_TOON_PROMPT_TEMPLATE
   }, "scene")
 };
 var defaultSnapshotTransformPresets = {
@@ -145,6 +151,7 @@ var defaultSnapshotTransformPresets = {
 var defaultSettings = {
   version: VERSION,
   schemaPresets: structuredClone(defaultSchemaPresets),
+  activeTrackerPresetKey: "scene",
   activeSchemaPresetKey: "scene",
   activeSchemaId: "scene",
   trackerConnectionId: null,
@@ -218,9 +225,12 @@ function deepMergeSettings(input, schemaPresets) {
     "snapshotHeader",
     "debugLogging"
   ]);
-  merged.schemaPresets = sanitizeSchemaPresetMap(schemaPresets ?? saved.schemaPresets);
-  merged.activeSchemaPresetKey = sanitizeId(readString(saved.activeSchemaPresetKey) || readString(saved.activeSchemaId) || merged.activeSchemaPresetKey) || "scene";
-  merged.activeSchemaId = merged.activeSchemaPresetKey;
+  merged.schemaPresets = sanitizeSchemaPresetMap(schemaPresets ?? saved.schemaPresets, merged);
+  merged.activeTrackerPresetKey = sanitizeId(
+    readString(saved.activeTrackerPresetKey) || readString(saved.activeSchemaPresetKey) || readString(saved.activeSchemaId) || merged.activeTrackerPresetKey
+  ) || "scene";
+  merged.activeSchemaPresetKey = merged.activeTrackerPresetKey;
+  merged.activeSchemaId = merged.activeTrackerPresetKey;
   merged.autoMode = normalizeAutoMode(saved.autoMode);
   merged.sequentialGeneration = readBool(saved.sequentialGeneration, readBool(saved.sequentialPartGeneration, merged.sequentialGeneration));
   merged.sequentialPartGeneration = merged.sequentialGeneration;
@@ -273,12 +283,14 @@ function deepMergeSettings(input, schemaPresets) {
   merged.savedTrackerPromptId = normalizeNullableString(merged.savedTrackerPromptId);
   merged.trackerInstructionPrompt = merged.trackerInstructionPrompt || merged.extractionPrompt || DEFAULT_EXTRACTION_PROMPT;
   merged.extractionPrompt = merged.trackerInstructionPrompt;
-  if (!merged.schemaPresets[merged.activeSchemaPresetKey]) {
-    merged.activeSchemaPresetKey = Object.keys(merged.schemaPresets)[0] ?? "scene";
-    merged.activeSchemaId = merged.activeSchemaPresetKey;
+  if (!merged.schemaPresets[merged.activeTrackerPresetKey]) {
+    merged.activeTrackerPresetKey = Object.keys(merged.schemaPresets)[0] ?? "scene";
+    merged.activeSchemaPresetKey = merged.activeTrackerPresetKey;
+    merged.activeSchemaId = merged.activeTrackerPresetKey;
   }
-  if (!merged.schemaPresets[merged.activeSchemaPresetKey]) {
+  if (!merged.schemaPresets[merged.activeTrackerPresetKey]) {
     merged.schemaPresets = structuredClone(defaultSchemaPresets);
+    merged.activeTrackerPresetKey = "scene";
     merged.activeSchemaPresetKey = "scene";
     merged.activeSchemaId = "scene";
   }
@@ -295,23 +307,25 @@ function settingsForStorage(settings) {
   delete copy.extractionPrompt;
   return copy;
 }
-function sanitizeSchemaPresetMap(input) {
+function sanitizeSchemaPresetMap(input, promptDefaults = defaultSettings) {
   if (!isPlainObject(input)) return structuredClone(defaultSchemaPresets);
   const out = {};
   for (const [fallbackKey, value] of Object.entries(input)) {
     if (!isPlainObject(value)) continue;
-    const preset = normalizeSchemaPreset(value, fallbackKey);
+    const preset = normalizeSchemaPreset(value, fallbackKey, promptDefaults);
     if (preset) out[preset.key] = preset;
   }
   return Object.keys(out).length > 0 ? out : structuredClone(defaultSchemaPresets);
 }
-function normalizeSchemaPreset(input, fallbackKey = "schema") {
+function normalizeSchemaPreset(input, fallbackKey = "schema", promptDefaults = {}) {
   const value = isPlainObject(input) ? input : {};
   const key = sanitizeId(readString(value.key) || readString(value.id) || fallbackKey) || sanitizeId(fallbackKey) || "schema";
   const schema = isPlainObject(value.jsonSchema) ? value.jsonSchema : isPlainObject(value.schema) ? value.schema : DEFAULT_SCHEMA;
   const template = readString(value.renderTemplate) || readString(value.templateHtml) || DEFAULT_TEMPLATE_HTML;
+  const systemPrompt = readString(value.systemPrompt) || readString(promptDefaults.systemPrompt) || DEFAULT_SYSTEM_PROMPT;
+  const trackerInstructionPrompt = readString(value.trackerInstructionPrompt) || readString(value.extractionPrompt) || readString(promptDefaults.trackerInstructionPrompt) || readString(promptDefaults.extractionPrompt) || DEFAULT_EXTRACTION_PROMPT;
   const now = Date.now();
-  return {
+  const preset = {
     id: key,
     key,
     name: readString(value.name) || key,
@@ -320,12 +334,32 @@ function normalizeSchemaPreset(input, fallbackKey = "schema") {
     jsonSchema: schema,
     templateHtml: template,
     renderTemplate: template,
+    systemPrompt,
+    extractionPrompt: trackerInstructionPrompt,
+    trackerInstructionPrompt,
+    jsonPromptTemplate: readString(value.jsonPromptTemplate) || readString(promptDefaults.jsonPromptTemplate) || DEFAULT_JSON_PROMPT_TEMPLATE,
+    xmlPromptTemplate: readString(value.xmlPromptTemplate) || readString(promptDefaults.xmlPromptTemplate) || DEFAULT_XML_PROMPT_TEMPLATE,
+    toonPromptTemplate: readString(value.toonPromptTemplate) || readString(promptDefaults.toonPromptTemplate) || DEFAULT_TOON_PROMPT_TEMPLATE,
     createdAt: sanitizeInteger(value.createdAt, now, 0, Number.MAX_SAFE_INTEGER),
     updatedAt: sanitizeInteger(value.updatedAt, now, 0, Number.MAX_SAFE_INTEGER)
   };
+  const outputMode = normalizeOptionalStructuredOutputMode(value.structuredOutputMode);
+  if (outputMode) preset.structuredOutputMode = outputMode;
+  return preset;
+}
+function schemaPresetNeedsMigration(input) {
+  if (!isPlainObject(input)) return false;
+  const requiredFields = [
+    "systemPrompt",
+    "trackerInstructionPrompt",
+    "jsonPromptTemplate",
+    "xmlPromptTemplate",
+    "toonPromptTemplate"
+  ];
+  return Object.values(input).some((value) => isPlainObject(value) && requiredFields.some((field) => typeof value[field] !== "string" || !value[field]));
 }
 function getSchemaPreset(settings, preferredId) {
-  const key = preferredId && settings.schemaPresets[preferredId] ? preferredId : settings.activeSchemaPresetKey;
+  const key = preferredId && settings.schemaPresets[preferredId] ? preferredId : settings.activeTrackerPresetKey || settings.activeSchemaPresetKey;
   return settings.schemaPresets[key] ?? settings.schemaPresets[Object.keys(settings.schemaPresets)[0]];
 }
 function getTopLevelSchemaKeys(schema) {
@@ -480,6 +514,10 @@ function normalizeStructuredOutputMode(value) {
   if (value === "native_json") return "native_json_schema";
   if (value === "json") return "json_prompt";
   return normalizeEnum(value, ["native_json_schema", "json_prompt", "xml_prompt", "toon_prompt"], "json_prompt");
+}
+function normalizeOptionalStructuredOutputMode(value) {
+  if (value === void 0 || value === null || value === "") return void 0;
+  return normalizeStructuredOutputMode(value);
 }
 function normalizeEnum(value, allowed, fallback) {
   return typeof value === "string" && allowed.includes(value) ? value : fallback;
@@ -688,6 +726,9 @@ var activeJobs = /* @__PURE__ */ new Map();
 var lastErrors = /* @__PURE__ */ new Map();
 var diagnostics = /* @__PURE__ */ new Map();
 var chatUserIds = /* @__PURE__ */ new Map();
+var connectionListWarnings = /* @__PURE__ */ new Set();
+var connectionStateWarnings = /* @__PURE__ */ new Set();
+var generationDiagnostics = /* @__PURE__ */ new Set();
 var lastFrontendUserId = null;
 var interceptorRegistered = false;
 function setUserFromFrontend(userId, chatId) {
@@ -733,6 +774,37 @@ function permissionWarnings() {
   }
   return warnings;
 }
+async function listConnectionProfiles(userId) {
+  if (typeof spindle.connections?.list !== "function") return [];
+  try {
+    const raw = await spindle.connections.list(userId);
+    const entries = Array.isArray(raw) ? raw : Array.isArray(raw?.connections) ? raw.connections : Array.isArray(raw?.profiles) ? raw.profiles : Array.isArray(raw?.items) ? raw.items : [];
+    return entries.flatMap((entry) => normalizeConnectionOption(entry)).sort((a, b) => a.name.localeCompare(b.name));
+  } catch (error) {
+    if (!connectionListWarnings.has(userId)) {
+      connectionListWarnings.add(userId);
+      await addDiagnostic(userId, `Tracktor could not list Lumiverse connection profiles: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return [];
+  }
+}
+function normalizeConnectionOption(input) {
+  if (!isPlainObject(input)) return [];
+  const id = readConnectionString(input.id) || readConnectionString(input.connection_id) || readConnectionString(input.key);
+  if (!id) return [];
+  const name = readConnectionString(input.name) || readConnectionString(input.label) || readConnectionString(input.displayName) || id;
+  const provider = readConnectionString(input.provider) || readConnectionString(input.providerName);
+  const model = readConnectionString(input.model) || readConnectionString(input.modelName);
+  return [{
+    id,
+    name,
+    ...provider ? { provider } : {},
+    ...model ? { model } : {}
+  }];
+}
+function readConnectionString(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
 async function loadSettings(userId) {
   const cached = settingsCache.get(userId);
   if (cached) return cached;
@@ -741,11 +813,17 @@ async function loadSettings(userId) {
     spindle.userStorage.getJson(SCHEMA_PRESETS_PATH, { fallback: null, userId }).catch(() => null),
     spindle.userStorage.getJson(DIAGNOSTICS_PATH, { fallback: { messages: [] }, userId }).catch(() => ({ messages: [] }))
   ]);
-  const schemaPresets = sanitizeSchemaPresetMap(savedSchemas ?? (isPlainObject(savedSettings) ? savedSettings.schemaPresets : null));
+  const rawSchemaPresets = savedSchemas ?? (isPlainObject(savedSettings) ? savedSettings.schemaPresets : null);
+  const migrationNeeded = schemaPresetNeedsMigration(rawSchemaPresets);
+  const promptDefaults = isPlainObject(savedSettings) ? savedSettings : defaultSettings;
+  const schemaPresets = sanitizeSchemaPresetMap(rawSchemaPresets, promptDefaults);
   const settings = deepMergeSettings(savedSettings, schemaPresets);
   settingsCache.set(userId, settings);
   if (Array.isArray(savedDiagnostics?.messages)) {
     diagnostics.set(userId, savedDiagnostics.messages.filter((item) => typeof item === "string").slice(0, 12));
+  }
+  if (migrationNeeded) {
+    await addDiagnostic(userId, "Tracktor migrated schema presets into tracker presets with per-preset prompts and templates.");
   }
   await saveSettings(settings, userId);
   return settings;
@@ -809,8 +887,25 @@ async function deleteSnapshot(userId, chatId, messageId) {
 async function buildState(userId, chatId) {
   const settings = await loadSettings(userId);
   const userJobs = [...activeJobs.values()].filter((job) => job.userId === userId).map((job) => job.state);
+  const availableConnections = await listConnectionProfiles(userId);
+  if (settings.trackerConnectionId && availableConnections.length > 0 && !availableConnections.some((item) => item.id === settings.trackerConnectionId)) {
+    const warningKey = `${userId}:missing:${settings.trackerConnectionId}`;
+    if (!connectionStateWarnings.has(warningKey)) {
+      connectionStateWarnings.add(warningKey);
+      await addDiagnostic(userId, `Selected Tracktor connection was not found: ${settings.trackerConnectionId}`);
+    }
+  }
+  const activePresetKey = settings.activeTrackerPresetKey || settings.activeSchemaPresetKey || settings.activeSchemaId;
+  if (activePresetKey && !settings.schemaPresets[activePresetKey]) {
+    const warningKey = `${userId}:missing-preset:${activePresetKey}`;
+    if (!connectionStateWarnings.has(warningKey)) {
+      connectionStateWarnings.add(warningKey);
+      await addDiagnostic(userId, `Selected Tracktor preset was not found: ${activePresetKey}`);
+    }
+  }
   return {
     settings,
+    availableConnections,
     activeChat: await getActiveChatState(settings, userId, chatId),
     permissionWarnings: permissionWarnings(),
     busy: userJobs.length > 0,
@@ -882,6 +977,26 @@ function resolveTargetMessage(messages, requestedMessageId) {
   if (!latest) throw new Error("No messages are available in the active chat.");
   return latest;
 }
+function resolvePresetRuntime(settings, preset) {
+  const trackerInstructionPrompt = preset.trackerInstructionPrompt || preset.extractionPrompt || settings.trackerInstructionPrompt || settings.extractionPrompt || defaultSettings.trackerInstructionPrompt;
+  return {
+    schema: preset.schema ?? preset.jsonSchema,
+    renderTemplate: preset.renderTemplate || preset.templateHtml,
+    systemPrompt: preset.systemPrompt || settings.systemPrompt || defaultSettings.systemPrompt,
+    trackerInstructionPrompt,
+    jsonPromptTemplate: preset.jsonPromptTemplate || settings.jsonPromptTemplate || defaultSettings.jsonPromptTemplate,
+    xmlPromptTemplate: preset.xmlPromptTemplate || settings.xmlPromptTemplate || defaultSettings.xmlPromptTemplate,
+    toonPromptTemplate: preset.toonPromptTemplate || settings.toonPromptTemplate || defaultSettings.toonPromptTemplate,
+    structuredOutputMode: preset.structuredOutputMode ?? settings.structuredOutputMode
+  };
+}
+async function addGenerationDiagnosticOnce(userId, key, message, debugOnly = false, settings) {
+  if (debugOnly && !settings?.debugLogging) return;
+  const diagnosticKey = `${userId}:${key}`;
+  if (generationDiagnostics.has(diagnosticKey)) return;
+  generationDiagnostics.add(diagnosticKey);
+  await addDiagnostic(userId, message);
+}
 async function generateTrackerForMessage(options) {
   if (!hasPermission("generation")) throw new Error("Generation permission is not granted.");
   if (!hasPermission("chats")) throw new Error("Chats permission is not granted.");
@@ -897,37 +1012,43 @@ async function generateTrackerForMessage(options) {
     throw new Error(`Tracker generation is skipped for the first ${settings.skipFirstMessages} messages.`);
   }
   const chatConfig = await loadChatConfig(options.userId, chat.id);
-  const preset = getSchemaPreset(settings, chatConfig.schemaPresetKey ?? chatConfig.schemaId);
+  const requestedPresetKey = chatConfig.schemaPresetKey ?? chatConfig.schemaId ?? settings.activeTrackerPresetKey ?? settings.activeSchemaPresetKey;
+  if (requestedPresetKey && !settings.schemaPresets[requestedPresetKey]) {
+    await addGenerationDiagnosticOnce(options.userId, `missing-preset:${requestedPresetKey}`, `Tracktor preset "${requestedPresetKey}" was missing; generation fell back to an available tracker preset.`);
+  }
+  const preset = getSchemaPreset(settings, requestedPresetKey);
+  const runtime = resolvePresetRuntime(settings, preset);
+  await addGenerationDiagnosticOnce(options.userId, `preset:${preset.key}`, `Tracktor generation using tracker preset "${preset.name}" (${preset.key}).`);
   const snapshots = await loadSnapshots(options.userId, chat.id);
   const priorSnapshots = collectPriorSnapshots(messages, snapshots, targetIndex, settings.includeLastTrackers);
   const sequential = options.sequential ?? settings.sequentialGeneration;
-  const data = sequential ? await generateTrackerSequential(messages, targetIndex, settings, preset, priorSnapshots, options.userId, options.job) : await generateTrackerFull(messages, targetIndex, settings, preset, priorSnapshots, options.userId, options.job?.controller.signal);
-  assertSchemaRequired(data, preset.schema);
-  const snapshot = makeTrackerSnapshot(chat.id, target.id, preset, data, snapshots.find((item) => item.messageId === target.id));
+  const data = sequential ? await generateTrackerSequential(messages, targetIndex, settings, preset, runtime, priorSnapshots, options.userId, options.job) : await generateTrackerFull(messages, targetIndex, settings, preset, runtime, priorSnapshots, options.userId, options.job?.controller.signal);
+  assertSchemaRequired(data, runtime.schema);
+  const snapshot = makeTrackerSnapshot(chat.id, target.id, preset, runtime, data, snapshots.find((item) => item.messageId === target.id));
   renderTrackerTemplate(snapshot.renderTemplate, snapshot.value);
   await persistTrackerSnapshot(options.userId, target, snapshot, settings);
   return snapshot;
 }
-async function generateTrackerFull(messages, targetIndex, settings, preset, priorSnapshots, userId, signal) {
-  const prompt = buildTrackerPrompt(messages, targetIndex, settings, preset, priorSnapshots);
-  const data = await requestJsonForSchema(prompt, preset.schema, "tracktor_tracker", settings, userId, signal);
+async function generateTrackerFull(messages, targetIndex, settings, preset, runtime, priorSnapshots, userId, signal) {
+  const prompt = buildTrackerPrompt(messages, targetIndex, settings, preset, runtime, priorSnapshots);
+  const data = await requestJsonForSchema(prompt, runtime.schema, "tracktor_tracker", settings, runtime, userId, signal);
   if (!isPlainObject(data)) throw new Error("Tracker response was not a JSON object.");
   return data;
 }
-async function generateTrackerSequential(messages, targetIndex, settings, preset, priorSnapshots, userId, job) {
-  const keys = getTopLevelSchemaKeys(preset.schema);
+async function generateTrackerSequential(messages, targetIndex, settings, preset, runtime, priorSnapshots, userId, job) {
+  const keys = getTopLevelSchemaKeys(runtime.schema);
   if (keys.length === 0) throw new Error("The active tracker schema has no top-level properties.");
   const tracker = {};
   for (let index = 0; index < keys.length; index += 1) {
     if (job?.controller.signal.aborted) throw new DOMException("Tracker generation cancelled.", "AbortError");
     const key = keys[index];
     updateJob(job, { currentPart: index + 1, totalParts: keys.length, label: `Generating ${key}` });
-    const partSchema = buildTopLevelPartSchema(preset.schema, key);
-    const prompt = buildTrackerPrompt(messages, targetIndex, settings, preset, priorSnapshots, {
+    const partSchema = buildTopLevelPartSchema(runtime.schema, key);
+    const prompt = buildTrackerPrompt(messages, targetIndex, settings, preset, runtime, priorSnapshots, {
       partKey: key,
       trackerSoFar: tracker
     });
-    const part = await requestJsonForSchema(prompt, partSchema, `tracktor_${key}`, settings, userId, job?.controller.signal);
+    const part = await requestJsonForSchema(prompt, partSchema, `tracktor_${key}`, settings, runtime, userId, job?.controller.signal);
     if (!part || typeof part !== "object" || !(key in part)) {
       throw new Error(`Part response did not include "${key}".`);
     }
@@ -935,12 +1056,12 @@ async function generateTrackerSequential(messages, targetIndex, settings, preset
   }
   return tracker;
 }
-async function requestJsonForSchema(promptMessages, schema, schemaName, settings, userId, signal) {
+async function requestJsonForSchema(promptMessages, schema, schemaName, settings, runtime, userId, signal) {
   const parameters = {
     max_tokens: settings.maxResponseTokens
   };
   const messages = [...promptMessages];
-  if (settings.structuredOutputMode === "native_json_schema") {
+  if (runtime.structuredOutputMode === "native_json_schema") {
     parameters.response_format = {
       type: "json_schema",
       json_schema: {
@@ -952,8 +1073,13 @@ async function requestJsonForSchema(promptMessages, schema, schemaName, settings
   } else {
     messages.push({
       role: "user",
-      content: buildFormatInstruction(settings, schema)
+      content: buildFormatInstruction(runtime, schema)
     });
+  }
+  if (settings.trackerConnectionId) {
+    await addGenerationDiagnosticOnce(userId, `connection:${settings.trackerConnectionId}`, `Tracktor generation using selected Lumiverse connection: ${settings.trackerConnectionId}.`);
+  } else {
+    await addGenerationDiagnosticOnce(userId, "connection:active", "Tracktor generation using the active Lumiverse connection.");
   }
   const result = await spindle.generate.quiet({
     type: "quiet",
@@ -971,20 +1097,20 @@ async function requestJsonForSchema(promptMessages, schema, schemaName, settings
   }
   return parsed.data;
 }
-function buildTrackerPrompt(messages, targetIndex, settings, preset, priorSnapshots, options = {}) {
+function buildTrackerPrompt(messages, targetIndex, settings, preset, runtime, priorSnapshots, options = {}) {
   const limit = settings.trackerContextMessageLimit;
   const start = limit <= 0 ? 0 : Math.max(0, targetIndex - limit + 1);
   const recent = messages.slice(start, targetIndex + 1);
   const target = messages[targetIndex];
   const partLine = options.partKey ? `Generate only the top-level "${options.partKey}" property and return it wrapped in a JSON object.` : "Generate the complete tracker object.";
   const prompt = [
-    { role: "system", content: settings.systemPrompt },
+    { role: "system", content: runtime.systemPrompt },
     {
       role: "user",
       content: [
-        settings.trackerInstructionPrompt,
+        runtime.trackerInstructionPrompt,
         partLine,
-        `Active schema preset: ${preset.name}`,
+        `Active tracker preset: ${preset.name}`,
         `Target message id: ${target.id}`
       ].join("\n")
     }
@@ -1014,8 +1140,8 @@ ${formatConversation(recent, settings)}`
   });
   return prompt;
 }
-function buildFormatInstruction(settings, schema) {
-  const template = settings.structuredOutputMode === "xml_prompt" ? settings.xmlPromptTemplate : settings.structuredOutputMode === "toon_prompt" ? settings.toonPromptTemplate : settings.jsonPromptTemplate;
+function buildFormatInstruction(runtime, schema) {
+  const template = runtime.structuredOutputMode === "xml_prompt" ? runtime.xmlPromptTemplate : runtime.structuredOutputMode === "toon_prompt" ? runtime.toonPromptTemplate : runtime.jsonPromptTemplate;
   return template.replaceAll("{{schema}}", JSON.stringify(schema, null, 2)).replaceAll("{{example_response}}", JSON.stringify(schemaToExample(schema), null, 2)).replaceAll("{{format_instructions}}", "Return only valid JSON that matches the schema.").replaceAll("{{current_tracker}}", "").replaceAll("{{target_part}}", "");
 }
 function formatConversation(messages, settings) {
@@ -1036,7 +1162,7 @@ function collectPriorSnapshots(messages, snapshots, targetIndex, limit) {
     return typeof index === "number" && index <= targetIndex;
   }).sort((a, b) => (messageIndex.get(a.messageId) ?? 0) - (messageIndex.get(b.messageId) ?? 0)).slice(-limit);
 }
-function makeTrackerSnapshot(chatId, messageId, preset, data, existing) {
+function makeTrackerSnapshot(chatId, messageId, preset, runtime, data, existing, options = {}) {
   const now = Date.now();
   return {
     id: existing?.id ?? makeSnapshotId(chatId, messageId),
@@ -1044,8 +1170,8 @@ function makeTrackerSnapshot(chatId, messageId, preset, data, existing) {
     messageId,
     schemaPresetKey: preset.key,
     value: data,
-    renderTemplate: preset.renderTemplate,
-    partsOrder: getTopLevelSchemaKeys(preset.schema),
+    renderTemplate: options.renderTemplate ?? runtime.renderTemplate,
+    partsOrder: getTopLevelSchemaKeys(runtime.schema),
     partsMeta: existing?.partsMeta ?? {},
     pendingRedactions: existing?.pendingRedactions ?? {},
     createdAt: existing?.createdAt ?? now,
@@ -1077,7 +1203,10 @@ async function updateTrackerData(userId, chatId, messageId, data) {
   const snapshots = await loadSnapshots(userId, chatId);
   const current = snapshots.find((item) => item.messageId === messageId) ?? legacySnapshotFromMessage(chatId, message);
   const preset = getSchemaPreset(settings, current?.schemaPresetKey);
-  const snapshot = makeTrackerSnapshot(chatId, messageId, preset, data, current);
+  const runtime = resolvePresetRuntime(settings, preset);
+  const snapshot = makeTrackerSnapshot(chatId, messageId, preset, runtime, data, current, {
+    renderTemplate: current?.renderTemplate || runtime.renderTemplate
+  });
   renderTrackerTemplate(snapshot.renderTemplate, snapshot.value);
   await persistTrackerSnapshot(userId, message, snapshot, settings);
 }
@@ -1092,16 +1221,16 @@ async function deleteTracker(userId, chatId, messageId) {
   }
 }
 async function regeneratePart(userId, chatId, messageId, partKey) {
-  const { settings, messages, targetIndex, preset, snapshot, message } = await loadSnapshotGenerationContext(userId, chatId, messageId);
-  const schema = buildTopLevelPartSchema(preset.schema, partKey);
-  const prompt = buildTrackerPrompt(messages, targetIndex, settings, preset, [], {
+  const { settings, messages, targetIndex, preset, runtime, snapshot, message } = await loadSnapshotGenerationContext(userId, chatId, messageId);
+  const schema = buildTopLevelPartSchema(runtime.schema, partKey);
+  const prompt = buildTrackerPrompt(messages, targetIndex, settings, preset, runtime, [], {
     partKey,
     trackerSoFar: omitKey(snapshot.value, partKey)
   });
-  const part = await requestJsonForSchema(prompt, schema, `tracktor_${partKey}`, settings, userId);
+  const part = await requestJsonForSchema(prompt, schema, `tracktor_${partKey}`, settings, runtime, userId);
   if (!isPlainObject(part) || !(partKey in part)) throw new Error(`Part response did not include "${partKey}".`);
   const next = { ...snapshot.value, [partKey]: part[partKey] };
-  const updated = makeTrackerSnapshot(chatId, messageId, preset, next, snapshot);
+  const updated = makeTrackerSnapshot(chatId, messageId, preset, runtime, next, snapshot);
   await persistTrackerSnapshot(userId, message, updated, settings);
 }
 async function loadSnapshotGenerationContext(userId, chatId, messageId) {
@@ -1113,8 +1242,9 @@ async function loadSnapshotGenerationContext(userId, chatId, messageId) {
   const snapshot = snapshots.find((item) => item.messageId === messageId) ?? legacySnapshotFromMessage(chatId, message);
   if (!snapshot) throw new Error("No tracker snapshot is saved for this message.");
   const preset = getSchemaPreset(settings, snapshot.schemaPresetKey);
+  const runtime = resolvePresetRuntime(settings, preset);
   const targetIndex = messages.findIndex((item) => item.id === messageId);
-  return { settings, messages, message, snapshot, preset, targetIndex };
+  return { settings, messages, message, snapshot, preset, runtime, targetIndex };
 }
 function omitKey(value, key) {
   const next = { ...value };

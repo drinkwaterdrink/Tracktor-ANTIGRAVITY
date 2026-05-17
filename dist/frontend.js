@@ -1,5 +1,5 @@
 // src/shared.ts
-var VERSION = "0.2.0";
+var VERSION = "0.3.0";
 var DEFAULT_SYSTEM_PROMPT = `You are a structured tracker extraction assistant. Analyze the conversation and return only tracker data that matches the requested schema. Do not roleplay, continue the scene, explain yourself, or include markdown unless the tracker format instructions explicitly ask for it. Preserve continuity with previous tracker snapshots, but update the tracker from the newest chat evidence.`;
 var DEFAULT_EXTRACTION_PROMPT = `Create a complete tracker update for the target message. Fill every required field. If a field is not explicitly stated, infer a short, reasonable value from the conversation context. Keep values concise and concrete.`;
 var DEFAULT_JSON_PROMPT_TEMPLATE = [
@@ -103,7 +103,13 @@ var defaultSchemaPresets = {
     jsonSchema: DEFAULT_SCHEMA,
     schema: DEFAULT_SCHEMA,
     renderTemplate: DEFAULT_TEMPLATE_HTML,
-    templateHtml: DEFAULT_TEMPLATE_HTML
+    templateHtml: DEFAULT_TEMPLATE_HTML,
+    systemPrompt: DEFAULT_SYSTEM_PROMPT,
+    extractionPrompt: DEFAULT_EXTRACTION_PROMPT,
+    trackerInstructionPrompt: DEFAULT_EXTRACTION_PROMPT,
+    jsonPromptTemplate: DEFAULT_JSON_PROMPT_TEMPLATE,
+    xmlPromptTemplate: DEFAULT_XML_PROMPT_TEMPLATE,
+    toonPromptTemplate: DEFAULT_TOON_PROMPT_TEMPLATE
   }, "scene")
 };
 var defaultSnapshotTransformPresets = {
@@ -141,6 +147,7 @@ var defaultSnapshotTransformPresets = {
 var defaultSettings = {
   version: VERSION,
   schemaPresets: structuredClone(defaultSchemaPresets),
+  activeTrackerPresetKey: "scene",
   activeSchemaPresetKey: "scene",
   activeSchemaId: "scene",
   trackerConnectionId: null,
@@ -214,9 +221,12 @@ function deepMergeSettings(input, schemaPresets) {
     "snapshotHeader",
     "debugLogging"
   ]);
-  merged.schemaPresets = sanitizeSchemaPresetMap(schemaPresets ?? saved.schemaPresets);
-  merged.activeSchemaPresetKey = sanitizeId(readString(saved.activeSchemaPresetKey) || readString(saved.activeSchemaId) || merged.activeSchemaPresetKey) || "scene";
-  merged.activeSchemaId = merged.activeSchemaPresetKey;
+  merged.schemaPresets = sanitizeSchemaPresetMap(schemaPresets ?? saved.schemaPresets, merged);
+  merged.activeTrackerPresetKey = sanitizeId(
+    readString(saved.activeTrackerPresetKey) || readString(saved.activeSchemaPresetKey) || readString(saved.activeSchemaId) || merged.activeTrackerPresetKey
+  ) || "scene";
+  merged.activeSchemaPresetKey = merged.activeTrackerPresetKey;
+  merged.activeSchemaId = merged.activeTrackerPresetKey;
   merged.autoMode = normalizeAutoMode(saved.autoMode);
   merged.sequentialGeneration = readBool(saved.sequentialGeneration, readBool(saved.sequentialPartGeneration, merged.sequentialGeneration));
   merged.sequentialPartGeneration = merged.sequentialGeneration;
@@ -269,34 +279,38 @@ function deepMergeSettings(input, schemaPresets) {
   merged.savedTrackerPromptId = normalizeNullableString(merged.savedTrackerPromptId);
   merged.trackerInstructionPrompt = merged.trackerInstructionPrompt || merged.extractionPrompt || DEFAULT_EXTRACTION_PROMPT;
   merged.extractionPrompt = merged.trackerInstructionPrompt;
-  if (!merged.schemaPresets[merged.activeSchemaPresetKey]) {
-    merged.activeSchemaPresetKey = Object.keys(merged.schemaPresets)[0] ?? "scene";
-    merged.activeSchemaId = merged.activeSchemaPresetKey;
+  if (!merged.schemaPresets[merged.activeTrackerPresetKey]) {
+    merged.activeTrackerPresetKey = Object.keys(merged.schemaPresets)[0] ?? "scene";
+    merged.activeSchemaPresetKey = merged.activeTrackerPresetKey;
+    merged.activeSchemaId = merged.activeTrackerPresetKey;
   }
-  if (!merged.schemaPresets[merged.activeSchemaPresetKey]) {
+  if (!merged.schemaPresets[merged.activeTrackerPresetKey]) {
     merged.schemaPresets = structuredClone(defaultSchemaPresets);
+    merged.activeTrackerPresetKey = "scene";
     merged.activeSchemaPresetKey = "scene";
     merged.activeSchemaId = "scene";
   }
   return merged;
 }
-function sanitizeSchemaPresetMap(input) {
+function sanitizeSchemaPresetMap(input, promptDefaults = defaultSettings) {
   if (!isPlainObject(input)) return structuredClone(defaultSchemaPresets);
   const out = {};
   for (const [fallbackKey, value] of Object.entries(input)) {
     if (!isPlainObject(value)) continue;
-    const preset = normalizeSchemaPreset(value, fallbackKey);
+    const preset = normalizeSchemaPreset(value, fallbackKey, promptDefaults);
     if (preset) out[preset.key] = preset;
   }
   return Object.keys(out).length > 0 ? out : structuredClone(defaultSchemaPresets);
 }
-function normalizeSchemaPreset(input, fallbackKey = "schema") {
+function normalizeSchemaPreset(input, fallbackKey = "schema", promptDefaults = {}) {
   const value = isPlainObject(input) ? input : {};
   const key = sanitizeId(readString(value.key) || readString(value.id) || fallbackKey) || sanitizeId(fallbackKey) || "schema";
   const schema = isPlainObject(value.jsonSchema) ? value.jsonSchema : isPlainObject(value.schema) ? value.schema : DEFAULT_SCHEMA;
   const template = readString(value.renderTemplate) || readString(value.templateHtml) || DEFAULT_TEMPLATE_HTML;
+  const systemPrompt = readString(value.systemPrompt) || readString(promptDefaults.systemPrompt) || DEFAULT_SYSTEM_PROMPT;
+  const trackerInstructionPrompt = readString(value.trackerInstructionPrompt) || readString(value.extractionPrompt) || readString(promptDefaults.trackerInstructionPrompt) || readString(promptDefaults.extractionPrompt) || DEFAULT_EXTRACTION_PROMPT;
   const now = Date.now();
-  return {
+  const preset = {
     id: key,
     key,
     name: readString(value.name) || key,
@@ -305,9 +319,18 @@ function normalizeSchemaPreset(input, fallbackKey = "schema") {
     jsonSchema: schema,
     templateHtml: template,
     renderTemplate: template,
+    systemPrompt,
+    extractionPrompt: trackerInstructionPrompt,
+    trackerInstructionPrompt,
+    jsonPromptTemplate: readString(value.jsonPromptTemplate) || readString(promptDefaults.jsonPromptTemplate) || DEFAULT_JSON_PROMPT_TEMPLATE,
+    xmlPromptTemplate: readString(value.xmlPromptTemplate) || readString(promptDefaults.xmlPromptTemplate) || DEFAULT_XML_PROMPT_TEMPLATE,
+    toonPromptTemplate: readString(value.toonPromptTemplate) || readString(promptDefaults.toonPromptTemplate) || DEFAULT_TOON_PROMPT_TEMPLATE,
     createdAt: sanitizeInteger(value.createdAt, now, 0, Number.MAX_SAFE_INTEGER),
     updatedAt: sanitizeInteger(value.updatedAt, now, 0, Number.MAX_SAFE_INTEGER)
   };
+  const outputMode = normalizeOptionalStructuredOutputMode(value.structuredOutputMode);
+  if (outputMode) preset.structuredOutputMode = outputMode;
+  return preset;
 }
 function safePreview(value, max = 160) {
   const compact = value.replace(/\s+/g, " ").trim();
@@ -357,6 +380,10 @@ function normalizeStructuredOutputMode(value) {
   if (value === "native_json") return "native_json_schema";
   if (value === "json") return "json_prompt";
   return normalizeEnum(value, ["native_json_schema", "json_prompt", "xml_prompt", "toon_prompt"], "json_prompt");
+}
+function normalizeOptionalStructuredOutputMode(value) {
+  if (value === void 0 || value === null || value === "") return void 0;
+  return normalizeStructuredOutputMode(value);
 }
 function normalizeEnum(value, allowed, fallback) {
   return typeof value === "string" && allowed.includes(value) ? value : fallback;
@@ -701,8 +728,8 @@ function render() {
         ${renderStatus(state)}
         ${renderToolbar(state)}
         ${renderTrackers(state)}
-        ${renderSettings(state.settings)}
-        ${renderSchemaEditor(state.settings)}
+        ${renderSettings(state.settings, state)}
+        ${renderSchemaEditor(state.settings, state)}
       </div>
     `;
   }
@@ -712,12 +739,12 @@ function renderHeader() {
     <header class="tracktor-header">
       <div>
         <strong>Tracktor</strong>
-        <span>Schema tracker snapshots for Lumiverse chats</span>
+        <span>Tracker presets and snapshots for Lumiverse chats</span>
       </div>
       <div class="tracktor-tabs" aria-label="Tracktor sections">
         <span>Current</span>
         <span>Settings</span>
-        <span>Schema</span>
+        <span>Preset</span>
         <span>Diagnostics</span>
       </div>
     </header>
@@ -772,10 +799,10 @@ function renderTrackerItem(item) {
           <strong>${escapeHtml(item.tracker.schemaName)}</strong>
           <span>${escapeHtml(item.role)} message: ${escapeHtml(item.messagePreview || item.messageId)}</span>
         </div>
-        <div class="tracktor-actions">
-          <button type="button" data-action="regenerate" data-chat-id="${escapeHtml(item.chatId)}" data-message-id="${escapeHtml(item.messageId)}">Regenerate</button>
-          <button type="button" data-action="edit" data-chat-id="${escapeHtml(item.chatId)}" data-message-id="${escapeHtml(item.messageId)}">Edit JSON</button>
-          <button type="button" data-action="delete" data-chat-id="${escapeHtml(item.chatId)}" data-message-id="${escapeHtml(item.messageId)}">Delete</button>
+        <div class="tracktor-actions tracktor-icon-actions">
+          ${renderIconButton("regenerate", ICON_REGENERATE, "Regenerate tracker", { chatId: item.chatId, messageId: item.messageId })}
+          ${renderIconButton("edit", ICON_EDIT, "Edit tracker JSON", { chatId: item.chatId, messageId: item.messageId })}
+          ${renderIconButton("delete", ICON_DELETE, "Delete tracker", { chatId: item.chatId, messageId: item.messageId })}
         </div>
       </div>
       ${partButtons ? `<details class="tracktor-parts"><summary>Regenerate section</summary><div class="tracktor-actions">${partButtons}</div></details>` : ""}
@@ -783,20 +810,27 @@ function renderTrackerItem(item) {
     </article>
   `;
 }
-function renderSettings(settings) {
+function renderIconButton(action, iconSvg, label, dataAttrs) {
+  const attrs = Object.entries(dataAttrs).map(([key, value]) => `data-${toKebabCase(key)}="${escapeHtml(value)}"`).join(" ");
+  return `<button type="button" class="tracktor-icon-button" data-action="${escapeHtml(action)}" ${attrs} title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}">${iconSvg}</button>`;
+}
+function toKebabCase(value) {
+  return value.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
+}
+function renderSettings(settings, current) {
+  const chat = current?.activeChat;
   return `
     <section class="tracktor-section">
-      <h2>Settings</h2>
-      <div class="tracktor-form-grid">
-        <label>Structured output
-          <select data-setting="structuredOutputMode">
-            <option value="json_prompt" ${settings.structuredOutputMode === "json_prompt" ? "selected" : ""}>Prompted JSON</option>
-            <option value="native_json_schema" ${settings.structuredOutputMode === "native_json_schema" ? "selected" : ""}>Native JSON schema</option>
-            <option value="xml_prompt" ${settings.structuredOutputMode === "xml_prompt" ? "selected" : ""}>XML prompt fallback</option>
-            <option value="toon_prompt" ${settings.structuredOutputMode === "toon_prompt" ? "selected" : ""}>TOON prompt fallback</option>
+      <h2>Controls</h2>
+      <div class="tracktor-form-grid tracktor-common-controls">
+        ${renderConnectionControl(settings, current?.availableConnections ?? [])}
+        ${renderTrackerPresetSelect(settings)}
+        <label>Output Mode
+          <select data-setting="structuredOutputMode" data-autosave="settings">
+            ${renderStructuredOutputOptions(settings.structuredOutputMode)}
           </select>
         </label>
-        <label>Auto mode
+        <label>Auto Mode
           <select data-setting="autoMode">
             <option value="none" ${settings.autoMode === "none" ? "selected" : ""}>None</option>
             <option value="responses" ${settings.autoMode === "responses" ? "selected" : ""}>Responses</option>
@@ -804,12 +838,22 @@ function renderSettings(settings) {
             <option value="both" ${settings.autoMode === "both" ? "selected" : ""}>Both</option>
           </select>
         </label>
-        <label>Tracker connection id
-          <input data-setting="trackerConnectionId" value="${escapeHtml(settings.trackerConnectionId ?? "")}" placeholder="Use active connection">
+        <label class="tracktor-check tracktor-common-check">
+          <input data-setting="injectTrackerSnapshots" type="checkbox" ${settings.injectTrackerSnapshots ? "checked" : ""}>
+          Inject snapshots
         </label>
-        <label>Tracker preset id
-          <input data-setting="trackerPresetId" value="${escapeHtml(settings.trackerPresetId ?? "")}" placeholder="Optional">
-        </label>
+      </div>
+      <div class="tracktor-actions tracktor-primary-actions">
+        <button type="button" data-action="generate-latest" ${chat && !current?.busy ? "" : "disabled"}>Generate Tracker</button>
+        <button type="button" data-action="generate-latest-sequential" ${chat && !current?.busy ? "" : "disabled"}>Generate Sequential</button>
+        <button type="button" data-action="save-settings">Save Settings</button>
+      </div>
+      <details class="tracktor-details">
+        <summary>Generation</summary>
+        <div class="tracktor-form-grid">
+          <label>Lumiverse generation preset
+            <input data-setting="trackerPresetId" value="${escapeHtml(settings.trackerPresetId ?? "")}" placeholder="Optional id">
+          </label>
         <label>Recent messages
           <input data-setting="trackerContextMessageLimit" type="number" min="0" max="400" value="${settings.trackerContextMessageLimit}">
         </label>
@@ -827,9 +871,21 @@ function renderSettings(settings) {
           Sequential part generation
         </label>
         <label class="tracktor-check">
-          <input data-setting="injectTrackerSnapshots" type="checkbox" ${settings.injectTrackerSnapshots ? "checked" : ""}>
-          Inject snapshots into normal generations
+          <input data-setting="includeCharacterCardInTrackerPrompt" type="checkbox" ${settings.includeCharacterCardInTrackerPrompt ? "checked" : ""}>
+          Include character card
         </label>
+        <label>Conversation roles
+          <select data-setting="trackerConversationRoleMode">
+            <option value="preserve" ${settings.trackerConversationRoleMode === "preserve" ? "selected" : ""}>Preserve</option>
+            <option value="all_assistant" ${settings.trackerConversationRoleMode === "all_assistant" ? "selected" : ""}>All assistant</option>
+            <option value="plain_transcript" ${settings.trackerConversationRoleMode === "plain_transcript" ? "selected" : ""}>Plain transcript</option>
+          </select>
+        </label>
+        </div>
+      </details>
+      <details class="tracktor-details">
+        <summary>Injection</summary>
+        <div class="tracktor-form-grid">
         <label>Injected snapshots
           <input data-setting="trackerSnapshotCount" type="number" min="0" max="25" value="${settings.trackerSnapshotCount}">
         </label>
@@ -838,13 +894,6 @@ function renderSettings(settings) {
             <option value="system" ${settings.snapshotRole === "system" ? "selected" : ""}>System</option>
             <option value="user" ${settings.snapshotRole === "user" ? "selected" : ""}>User</option>
             <option value="assistant" ${settings.snapshotRole === "assistant" ? "selected" : ""}>Assistant</option>
-          </select>
-        </label>
-        <label>Conversation roles
-          <select data-setting="trackerConversationRoleMode">
-            <option value="preserve" ${settings.trackerConversationRoleMode === "preserve" ? "selected" : ""}>Preserve</option>
-            <option value="all_assistant" ${settings.trackerConversationRoleMode === "all_assistant" ? "selected" : ""}>All assistant</option>
-            <option value="plain_transcript" ${settings.trackerConversationRoleMode === "plain_transcript" ? "selected" : ""}>Plain transcript</option>
           </select>
         </label>
         <label>Snapshot transform
@@ -857,49 +906,143 @@ function renderSettings(settings) {
         <label>Chat variable key
           <input data-setting="chatVariableExport.key" value="${escapeHtml(settings.chatVariableExport.key)}">
         </label>
-      </div>
-      <label>System prompt
-        <textarea data-setting="systemPrompt" rows="5">${escapeHtml(settings.systemPrompt)}</textarea>
-      </label>
-      <label>Extraction prompt
-        <textarea data-setting="trackerInstructionPrompt" rows="4">${escapeHtml(settings.trackerInstructionPrompt)}</textarea>
-      </label>
-      <div class="tracktor-actions">
-        <button type="button" data-action="save-settings">Save Settings</button>
-        <button type="button" data-action="restore-default-prompts">Restore Built-in Tracker Prompt</button>
-      </div>
+        <label>Snapshot header
+          <input data-setting="snapshotHeader" value="${escapeHtml(settings.snapshotHeader)}">
+        </label>
+        <label class="tracktor-check">
+          <input data-setting="injectAsVirtualCharacter" type="checkbox" ${settings.injectAsVirtualCharacter ? "checked" : ""}>
+          Virtual Tracker speaker
+        </label>
+        <label class="tracktor-check">
+          <input data-setting="chatVariableExport.enabled" type="checkbox" ${settings.chatVariableExport.enabled ? "checked" : ""}>
+          Export chat variable
+        </label>
+        </div>
+      </details>
+      <details class="tracktor-details">
+        <summary>Diagnostics</summary>
+        <label class="tracktor-check">
+          <input data-setting="debugLogging" type="checkbox" ${settings.debugLogging ? "checked" : ""}>
+          Debug logging
+        </label>
+        ${(current?.diagnostics?.length ?? 0) > 0 ? current.diagnostics.map((item) => `<p class="tracktor-diagnostic-line">${escapeHtml(item)}</p>`).join("") : '<p class="tracktor-muted">No diagnostics yet.</p>'}
+      </details>
     </section>
   `;
 }
-function renderSchemaEditor(settings) {
+function renderConnectionControl(settings, connections) {
+  const selectedId = settings.trackerConnectionId ?? "";
+  const selectedMissing = !!selectedId && connections.length > 0 && !connections.some((connection) => connection.id === selectedId);
+  const options = [
+    `<option value="" ${selectedId ? "" : "selected"}>Use active connection</option>`,
+    selectedMissing ? `<option value="${escapeHtml(selectedId)}" selected>Saved: ${escapeHtml(selectedId)}</option>` : "",
+    ...connections.map((connection) => `<option value="${escapeHtml(connection.id)}" ${connection.id === selectedId ? "selected" : ""}>${escapeHtml(formatConnectionLabel(connection))}</option>`)
+  ].join("");
+  const warning = connections.length === 0 ? '<div class="tracktor-warning tracktor-compact-warning">Connection profiles are not available yet. Active connection fallback still works.</div>' : selectedMissing ? '<div class="tracktor-warning tracktor-compact-warning">Saved connection id was not found. You can keep it manually or choose another profile.</div>' : "";
+  return `
+    <label>Connection
+      <select data-setting="trackerConnectionId" data-autosave="settings">
+        ${options}
+      </select>
+    </label>
+    <div class="tracktor-field-note">
+      ${warning}
+      ${connections.length === 0 || selectedMissing ? `
+        <details class="tracktor-advanced-inline">
+          <summary>Advanced</summary>
+          <label>Manual connection id
+            <input data-setting="trackerConnectionId" value="${escapeHtml(selectedId)}" placeholder="Use active connection">
+          </label>
+        </details>
+      ` : ""}
+    </div>
+  `;
+}
+function renderTrackerPresetSelect(settings) {
   const presets = Object.values(settings.schemaPresets);
-  const active = settings.schemaPresets[settings.activeSchemaId] ?? presets[0];
+  const activeKey = getActiveTrackerPresetKey(settings);
+  return `
+    <label>Tracker Preset
+      <select data-setting="activeTrackerPresetKey" data-autosave="settings">
+        ${presets.map((preset) => `<option value="${escapeHtml(preset.key)}" ${preset.key === activeKey ? "selected" : ""}>${escapeHtml(preset.name)}</option>`).join("")}
+      </select>
+    </label>
+  `;
+}
+function renderStructuredOutputOptions(value, includeEmpty = false) {
+  const empty = includeEmpty ? `<option value="" ${value ? "" : "selected"}>Use global output mode</option>` : "";
+  return `${empty}
+    <option value="json_prompt" ${value === "json_prompt" ? "selected" : ""}>Prompted JSON</option>
+    <option value="native_json_schema" ${value === "native_json_schema" ? "selected" : ""}>Native JSON schema</option>
+    <option value="xml_prompt" ${value === "xml_prompt" ? "selected" : ""}>XML prompt fallback</option>
+    <option value="toon_prompt" ${value === "toon_prompt" ? "selected" : ""}>TOON prompt fallback</option>
+  `;
+}
+function formatConnectionLabel(connection) {
+  const detail = [connection.provider, connection.model].filter(Boolean).join(" / ");
+  return detail ? `${connection.name} (${detail})` : connection.name;
+}
+function getActiveTrackerPresetKey(settings) {
+  return settings.activeTrackerPresetKey || settings.activeSchemaPresetKey || settings.activeSchemaId || "scene";
+}
+function getActiveTrackerPreset(settings) {
+  const key = getActiveTrackerPresetKey(settings);
+  return settings.schemaPresets[key] ?? settings.schemaPresets[Object.keys(settings.schemaPresets)[0]];
+}
+function renderSchemaEditor(settings, current) {
+  const presets = Object.values(settings.schemaPresets);
+  const active = getActiveTrackerPreset(settings) ?? presets[0];
+  if (!active) return "";
   return `
     <section class="tracktor-section">
-      <h2>Schema</h2>
-      <div class="tracktor-form-grid">
-        <label>Active preset
-          <select data-setting="activeSchemaPresetKey">
-            ${presets.map((preset) => `<option value="${escapeHtml(preset.id)}" ${preset.id === active.id ? "selected" : ""}>${escapeHtml(preset.name)}</option>`).join("")}
-          </select>
+      <details class="tracktor-details" data-preset-editor>
+        <summary>Preset Editor</summary>
+        <div class="tracktor-form-grid">
+          <label>Preset id
+            <input data-preset-field="id" value="${escapeHtml(active.id)}" ${active.key === "scene" ? "readonly" : ""}>
+          </label>
+          <label>Name
+            <input data-preset-field="name" value="${escapeHtml(active.name)}">
+          </label>
+          <label>Description
+            <input data-preset-field="description" value="${escapeHtml(active.description ?? "")}">
+          </label>
+          <label>Preset output override
+            <select data-preset-field="structuredOutputMode">
+              ${renderStructuredOutputOptions(active.structuredOutputMode, true)}
+            </select>
+          </label>
+        </div>
+        <label>JSON schema
+          <textarea data-preset-field="schema" rows="12" spellcheck="false">${escapeHtml(JSON.stringify(active.schema, null, 2))}</textarea>
         </label>
-        <label>Preset id
-          <input data-schema-field="id" value="${escapeHtml(active.id)}">
+        <label>HTML template
+          <textarea data-preset-field="templateHtml" rows="8" spellcheck="false">${escapeHtml(active.templateHtml)}</textarea>
         </label>
-        <label>Preset name
-          <input data-schema-field="name" value="${escapeHtml(active.name)}">
+        <label>System prompt
+          <textarea data-preset-field="systemPrompt" rows="5">${escapeHtml(active.systemPrompt || settings.systemPrompt)}</textarea>
         </label>
-      </div>
-      <label>JSON schema
-        <textarea data-schema-field="schema" rows="14" spellcheck="false">${escapeHtml(JSON.stringify(active.schema, null, 2))}</textarea>
-      </label>
-      <label>HTML template
-        <textarea data-schema-field="templateHtml" rows="10" spellcheck="false">${escapeHtml(active.templateHtml)}</textarea>
-      </label>
-      <div class="tracktor-actions">
-        <button type="button" data-action="save-schema">Save Schema Preset</button>
-        <button type="button" data-action="use-schema-for-chat" ${state?.activeChat ? "" : "disabled"}>Use For This Chat</button>
-      </div>
+        <label>Extraction prompt
+          <textarea data-preset-field="trackerInstructionPrompt" rows="4">${escapeHtml(active.trackerInstructionPrompt || active.extractionPrompt || settings.trackerInstructionPrompt)}</textarea>
+        </label>
+        <label>JSON prompt template
+          <textarea data-preset-field="jsonPromptTemplate" rows="5">${escapeHtml(active.jsonPromptTemplate || settings.jsonPromptTemplate)}</textarea>
+        </label>
+        <label>XML prompt template
+          <textarea data-preset-field="xmlPromptTemplate" rows="4">${escapeHtml(active.xmlPromptTemplate || settings.xmlPromptTemplate)}</textarea>
+        </label>
+        <label>TOON prompt template
+          <textarea data-preset-field="toonPromptTemplate" rows="4">${escapeHtml(active.toonPromptTemplate || settings.toonPromptTemplate)}</textarea>
+        </label>
+        <div class="tracktor-actions">
+          <button type="button" data-action="new-preset">New Preset</button>
+          <button type="button" data-action="duplicate-preset">Duplicate Preset</button>
+          <button type="button" data-action="save-preset">Save Preset</button>
+          <button type="button" data-action="delete-preset" ${active.key === "scene" ? "disabled" : ""}>Delete Preset</button>
+          <button type="button" data-action="restore-built-in-preset">Restore Built-in Preset</button>
+          <button type="button" data-action="use-schema-for-chat" ${current?.activeChat ? "" : "disabled"}>Use For This Chat</button>
+        </div>
+      </details>
     </section>
   `;
 }
@@ -930,13 +1073,21 @@ function handleClick(event) {
     saveSettingsFromDom();
   } else if (action === "restore-default-prompts") {
     restoreDefaultPrompts();
-  } else if (action === "save-schema") {
-    saveSchemaFromDom(getRootForAction(button));
+  } else if (action === "save-schema" || action === "save-preset") {
+    savePresetFromDom(getPresetEditorForAction(button));
+  } else if (action === "new-preset") {
+    createNewPreset();
+  } else if (action === "duplicate-preset") {
+    duplicateActivePreset();
+  } else if (action === "delete-preset") {
+    void deleteActivePreset();
+  } else if (action === "restore-built-in-preset") {
+    restoreBuiltInPreset();
   } else if (action === "use-schema-for-chat") {
     sendBackend({
       type: "set_chat_schema",
       chatId: state.activeChat?.id,
-      schemaId: state.settings.activeSchemaPresetKey
+      schemaId: getActiveTrackerPresetKey(state.settings)
     });
   }
 }
@@ -945,6 +1096,7 @@ function handleChange(event) {
   if (!target?.dataset.setting || !state) return;
   applySettingValue(target);
   render();
+  if (target.dataset.autosave === "settings") saveSettingsFromDom();
 }
 function handleInput(event) {
   const target = event.target;
@@ -967,6 +1119,12 @@ function applySettingValue(target) {
   } else {
     owner[key] = target.value;
   }
+  if (key === "activeTrackerPresetKey" || key === "activeSchemaPresetKey" || key === "activeSchemaId") {
+    const activeKey = String(owner[key] ?? "");
+    settings.activeTrackerPresetKey = activeKey;
+    settings.activeSchemaPresetKey = activeKey;
+    settings.activeSchemaId = activeKey;
+  }
 }
 function saveSettingsFromDom() {
   if (!state) return;
@@ -980,34 +1138,140 @@ function restoreDefaultPrompts() {
   ctxRef.sendToBackend({ type: "save_settings", settings: deepMergeSettings(state.settings) });
   render();
 }
-function saveSchemaFromDom(sourceRoot) {
+function savePresetFromDom(editor) {
   if (!state) return;
-  const idInput = sourceRoot.querySelector('[data-schema-field="id"]');
-  const nameInput = sourceRoot.querySelector('[data-schema-field="name"]');
-  const schemaInput = sourceRoot.querySelector('[data-schema-field="schema"]');
-  const templateInput = sourceRoot.querySelector('[data-schema-field="templateHtml"]');
-  if (!idInput || !nameInput || !schemaInput || !templateInput) return;
   try {
-    const id = sanitizeId(idInput.value) || "schema";
-    const schema = JSON.parse(schemaInput.value);
     const settings = structuredClone(state.settings);
-    settings.schemaPresets[id] = {
-      id,
-      key: id,
-      name: nameInput.value.trim() || id,
-      schema,
-      jsonSchema: schema,
-      templateHtml: templateInput.value,
-      renderTemplate: templateInput.value,
-      createdAt: state.settings.schemaPresets[id]?.createdAt ?? Date.now(),
-      updatedAt: Date.now()
-    };
-    settings.activeSchemaPresetKey = id;
-    settings.activeSchemaId = id;
-    ctxRef.sendToBackend({ type: "save_settings", settings });
+    const previousKey = getActiveTrackerPresetKey(settings);
+    const previous = settings.schemaPresets[previousKey];
+    const preset = readPresetFromDom(editor, previous);
+    if (preset.key !== previousKey && settings.schemaPresets[preset.key]) {
+      throw new Error(`A tracker preset already exists with id "${preset.key}".`);
+    }
+    if (preset.key !== previousKey && previousKey !== "scene") {
+      delete settings.schemaPresets[previousKey];
+    }
+    settings.schemaPresets[preset.key] = preset;
+    setActivePreset(settings, preset.key);
+    persistSettings(settings);
   } catch (error) {
     showErrorModal(error instanceof Error ? error.message : String(error));
   }
+}
+function readPresetFromDom(editor, previous) {
+  const id = sanitizeId(readPresetField(editor, "id")) || previous?.key || "tracker";
+  const schemaText = readPresetField(editor, "schema") || JSON.stringify(previous?.schema ?? defaultSettings.schemaPresets.scene.schema, null, 2);
+  const schema = JSON.parse(schemaText);
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    throw new Error("Tracker preset JSON schema must be an object.");
+  }
+  const templateHtml = readPresetField(editor, "templateHtml") || previous?.templateHtml || defaultSettings.schemaPresets.scene.templateHtml;
+  const mode = readPresetField(editor, "structuredOutputMode");
+  return {
+    id,
+    key: id,
+    name: readPresetField(editor, "name") || previous?.name || id,
+    description: readPresetField(editor, "description") || void 0,
+    schema,
+    jsonSchema: schema,
+    templateHtml,
+    renderTemplate: templateHtml,
+    systemPrompt: readPresetField(editor, "systemPrompt") || previous?.systemPrompt || DEFAULT_SYSTEM_PROMPT,
+    extractionPrompt: readPresetField(editor, "trackerInstructionPrompt") || previous?.extractionPrompt || DEFAULT_EXTRACTION_PROMPT,
+    trackerInstructionPrompt: readPresetField(editor, "trackerInstructionPrompt") || previous?.trackerInstructionPrompt || DEFAULT_EXTRACTION_PROMPT,
+    jsonPromptTemplate: readPresetField(editor, "jsonPromptTemplate") || previous?.jsonPromptTemplate || DEFAULT_JSON_PROMPT_TEMPLATE,
+    xmlPromptTemplate: readPresetField(editor, "xmlPromptTemplate") || previous?.xmlPromptTemplate || DEFAULT_XML_PROMPT_TEMPLATE,
+    toonPromptTemplate: readPresetField(editor, "toonPromptTemplate") || previous?.toonPromptTemplate || DEFAULT_TOON_PROMPT_TEMPLATE,
+    ...mode ? { structuredOutputMode: mode } : {},
+    createdAt: previous?.createdAt ?? Date.now(),
+    updatedAt: Date.now()
+  };
+}
+function readPresetField(editor, field) {
+  const input = editor.querySelector(`[data-preset-field="${field}"]`);
+  if (!input) return "";
+  return input instanceof HTMLTextAreaElement ? input.value : input.value.trim();
+}
+function getPresetEditorForAction(button) {
+  return button.closest("[data-preset-editor]") ?? getRootForAction(button);
+}
+function createNewPreset() {
+  if (!state) return;
+  const settings = structuredClone(state.settings);
+  const base = defaultSettings.schemaPresets.scene;
+  const key = makeUniquePresetKey(settings, "tracker_preset");
+  settings.schemaPresets[key] = {
+    ...structuredClone(base),
+    id: key,
+    key,
+    name: "New Tracker Preset",
+    description: "Custom tracker preset.",
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  };
+  setActivePreset(settings, key);
+  persistSettings(settings);
+}
+function duplicateActivePreset() {
+  if (!state) return;
+  const settings = structuredClone(state.settings);
+  const active = getActiveTrackerPreset(settings);
+  if (!active) return;
+  const key = makeUniquePresetKey(settings, `${active.key}_copy`);
+  settings.schemaPresets[key] = {
+    ...structuredClone(active),
+    id: key,
+    key,
+    name: `${active.name} Copy`,
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  };
+  setActivePreset(settings, key);
+  persistSettings(settings);
+}
+async function deleteActivePreset() {
+  if (!state) return;
+  const settings = structuredClone(state.settings);
+  const key = getActiveTrackerPresetKey(settings);
+  if (key === "scene") return;
+  const confirmed = typeof ctxRef.ui?.showConfirm === "function" ? (await ctxRef.ui.showConfirm({
+    title: "Delete Tracker Preset",
+    message: `Delete tracker preset "${settings.schemaPresets[key]?.name ?? key}"?`,
+    variant: "danger",
+    confirmLabel: "Delete"
+  })).confirmed : window.confirm(`Delete tracker preset "${settings.schemaPresets[key]?.name ?? key}"?`);
+  if (!confirmed) return;
+  delete settings.schemaPresets[key];
+  setActivePreset(settings, settings.schemaPresets.scene ? "scene" : Object.keys(settings.schemaPresets)[0] ?? "scene");
+  persistSettings(settings);
+}
+function restoreBuiltInPreset() {
+  if (!state) return;
+  const settings = structuredClone(state.settings);
+  settings.schemaPresets.scene = structuredClone(defaultSettings.schemaPresets.scene);
+  setActivePreset(settings, "scene");
+  persistSettings(settings);
+}
+function makeUniquePresetKey(settings, base) {
+  const sanitizedBase = sanitizeId(base) || "tracker_preset";
+  let key = sanitizedBase;
+  let index = 2;
+  while (settings.schemaPresets[key]) {
+    key = `${sanitizedBase}_${index}`;
+    index += 1;
+  }
+  return key;
+}
+function setActivePreset(settings, key) {
+  settings.activeTrackerPresetKey = key;
+  settings.activeSchemaPresetKey = key;
+  settings.activeSchemaId = key;
+}
+function persistSettings(settings) {
+  if (!state) return;
+  state.settings = deepMergeSettings(settings, settings.schemaPresets);
+  ctxRef.sendToBackend({ type: "save_settings", settings: state.settings });
+  render();
 }
 function getRootForAction(button) {
   return button.closest(".tracktor-root") ?? roots[0];
@@ -1123,9 +1387,11 @@ function buildWidgetHtml(item) {
       .bar { display: flex; justify-content: space-between; gap: 8px; align-items: center; margin-bottom: 8px; }
       .title { font-weight: 650; }
       .meta { color: var(--lumiverse-text-muted, #aaa); font-size: 11px; }
-      button { border: 1px solid var(--lumiverse-border, #444); background: var(--lumiverse-fill, #111); color: inherit; border-radius: 6px; padding: 4px 7px; cursor: pointer; }
-      button:hover { border-color: var(--lumiverse-border-hover, #777); }
-      .actions { display: flex; gap: 5px; flex-wrap: wrap; }
+      button { border: 1px solid var(--lumiverse-border, #444); background: var(--lumiverse-fill, #111); color: inherit; border-radius: 7px; cursor: pointer; }
+      button:hover, button:focus-visible { border-color: var(--lumiverse-border-hover, #777); outline: none; }
+      .actions { display: flex; gap: 5px; flex-wrap: nowrap; align-items: center; }
+      .icon-button { width: 30px; height: 30px; padding: 0; display: inline-grid; place-items: center; flex: 0 0 auto; }
+      .icon-button svg { width: 15px; height: 15px; display: block; }
       table { width: 100%; border-collapse: collapse; }
       td { border-top: 1px solid var(--lumiverse-border, #444); padding: 4px 6px; vertical-align: top; }
       details { margin-top: 8px; }
@@ -1142,9 +1408,9 @@ function buildWidgetHtml(item) {
           <div class="meta">${escapeHtml(safePreview(item.messagePreview, 80))}</div>
         </div>
         <div class="actions">
-          <button data-action="regenerate">Regenerate</button>
-          <button data-action="edit">Edit</button>
-          <button data-action="delete">Delete</button>
+          <button class="icon-button" data-action="regenerate" title="Regenerate tracker" aria-label="Regenerate tracker">${ICON_REGENERATE}</button>
+          <button class="icon-button" data-action="edit" title="Edit tracker JSON" aria-label="Edit tracker JSON">${ICON_EDIT}</button>
+          <button class="icon-button" data-action="delete" title="Delete tracker" aria-label="Delete tracker">${ICON_DELETE}</button>
         </div>
       </div>
       ${rendered}
@@ -1161,6 +1427,9 @@ function buildWidgetHtml(item) {
 }
 var TRACKTOR_ICON = '<svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M4 5h11a3 3 0 0 1 3 3v1h1.2a2 2 0 0 1 1.8 1.1l1 2V17h-2.1a3 3 0 0 1-5.8 0H10a3 3 0 0 1-5.8 0H2V7a2 2 0 0 1 2-2Zm0 2v8h.8a3 3 0 0 1 4.4 0H14V8a1 1 0 0 0-1-1H4Zm12 4v4h.8a3 3 0 0 1 1.6-.8h1.6v-1.7l-.7-1.5H16ZM7 18a1 1 0 1 0 0-2 1 1 0 0 0 0 2Zm10 0a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z"/></svg>';
 var TRACKTOR_SMALL_ICON = '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M4 5h11a3 3 0 0 1 3 3v1h1.2a2 2 0 0 1 1.8 1.1l1 2V17h-2.1a3 3 0 0 1-5.8 0H10a3 3 0 0 1-5.8 0H2V7a2 2 0 0 1 2-2Z"/></svg>';
+var ICON_REGENERATE = '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M17.7 6.3A8 8 0 1 0 20 12h-2a6 6 0 1 1-1.76-4.24L13 11h8V3l-3.3 3.3Z"/></svg>';
+var ICON_EDIT = '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M4 17.25V20h2.75L17.8 8.95 15.05 6.2 4 17.25Zm15.7-10.1a1 1 0 0 0 0-1.42l-1.43-1.43a1 1 0 0 0-1.42 0l-1.1 1.1 2.75 2.75 1.2-1Z"/></svg>';
+var ICON_DELETE = '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M7 21a2 2 0 0 1-2-2V7h14v12a2 2 0 0 1-2 2H7ZM9 4h6l1 1h4v2H4V5h4l1-1Zm0 6v8h2v-8H9Zm4 0v8h2v-8h-2Z"/></svg>';
 var STYLES = `
   .tracktor-root { height: 100%; overflow: auto; color: var(--lumiverse-text); }
   .tracktor-settings-surface {
@@ -1277,9 +1546,42 @@ var STYLES = `
   .tracktor-actions button { padding: 6px 9px; cursor: pointer; }
   .tracktor-actions button:hover { border-color: var(--lumiverse-border-hover); }
   .tracktor-actions button:disabled { opacity: .45; cursor: default; }
+  .tracktor-primary-actions { margin-top: 8px; }
+  .tracktor-icon-actions { flex-wrap: nowrap; }
+  .tracktor-icon-button {
+    width: 30px;
+    height: 30px;
+    padding: 0 !important;
+    display: inline-grid;
+    place-items: center;
+    flex: 0 0 auto;
+    border-radius: 7px !important;
+  }
+  .tracktor-icon-button svg { width: 15px; height: 15px; display: block; }
+  .tracktor-icon-button:focus-visible { outline: 2px solid var(--lumiverse-accent); outline-offset: 2px; }
   .tracktor-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .tracktor-common-controls { align-items: end; }
+  .tracktor-field-note { display: flex; flex-direction: column; gap: 4px; }
+  .tracktor-compact-warning { margin-bottom: 4px; padding: 6px; }
+  .tracktor-details {
+    border: 1px solid var(--lumiverse-border);
+    background: var(--lumiverse-fill-subtle);
+    border-radius: 8px;
+    padding: 8px;
+    margin-top: 8px;
+  }
+  .tracktor-details > summary {
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 650;
+    color: var(--lumiverse-text);
+  }
+  .tracktor-details[open] > summary { margin-bottom: 8px; }
+  .tracktor-advanced-inline { font-size: 11px; color: var(--lumiverse-text-muted); }
+  .tracktor-diagnostic-line, .tracktor-muted { margin: 6px 0 0; color: var(--lumiverse-text-muted); font-size: 12px; }
   .tracktor-section label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--lumiverse-text-muted); margin-bottom: 8px; }
   .tracktor-check { flex-direction: row !important; align-items: center; color: var(--lumiverse-text) !important; }
+  .tracktor-common-check { min-height: 30px; margin-bottom: 0 !important; }
   .tracktor-section input, .tracktor-section select { min-height: 30px; padding: 4px 7px; }
   .tracktor-section textarea { width: 100%; resize: vertical; padding: 7px; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; box-sizing: border-box; }
   .tracktor-list { display: flex; flex-direction: column; gap: 8px; }
@@ -1317,6 +1619,7 @@ var STYLES = `
   .tracktor-json-editor { min-height: 420px; width: 100%; box-sizing: border-box; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   @media (max-width: 680px) {
     .tracktor-toolbar, .tracktor-item-head { flex-direction: column; align-items: stretch; }
+    .tracktor-item-head .tracktor-icon-actions { align-self: flex-start; }
     .tracktor-form-grid, .tracktor-grid { grid-template-columns: 1fr; }
   }
 `;

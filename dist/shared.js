@@ -3,7 +3,7 @@ export const METADATA_KEY = 'tracktor';
 export const SETTINGS_PATH = 'settings.json';
 export const SCHEMA_PRESETS_PATH = 'schema-presets.json';
 export const DIAGNOSTICS_PATH = 'diagnostics/latest.json';
-export const VERSION = '0.2.0';
+export const VERSION = '0.3.0';
 export const DEFAULT_SYSTEM_PROMPT = `You are a structured tracker extraction assistant. Analyze the conversation and return only tracker data that matches the requested schema. Do not roleplay, continue the scene, explain yourself, or include markdown unless the tracker format instructions explicitly ask for it. Preserve continuity with previous tracker snapshots, but update the tracker from the newest chat evidence.`;
 export const DEFAULT_EXTRACTION_PROMPT = `Create a complete tracker update for the target message. Fill every required field. If a field is not explicitly stated, infer a short, reasonable value from the conversation context. Keep values concise and concrete.`;
 export const DEFAULT_JSON_PROMPT_TEMPLATE = [
@@ -108,6 +108,12 @@ export const defaultSchemaPresets = {
         schema: DEFAULT_SCHEMA,
         renderTemplate: DEFAULT_TEMPLATE_HTML,
         templateHtml: DEFAULT_TEMPLATE_HTML,
+        systemPrompt: DEFAULT_SYSTEM_PROMPT,
+        extractionPrompt: DEFAULT_EXTRACTION_PROMPT,
+        trackerInstructionPrompt: DEFAULT_EXTRACTION_PROMPT,
+        jsonPromptTemplate: DEFAULT_JSON_PROMPT_TEMPLATE,
+        xmlPromptTemplate: DEFAULT_XML_PROMPT_TEMPLATE,
+        toonPromptTemplate: DEFAULT_TOON_PROMPT_TEMPLATE,
     }, 'scene'),
 };
 export const defaultSnapshotTransformPresets = {
@@ -145,6 +151,7 @@ export const defaultSnapshotTransformPresets = {
 export const defaultSettings = {
     version: VERSION,
     schemaPresets: structuredClone(defaultSchemaPresets),
+    activeTrackerPresetKey: 'scene',
     activeSchemaPresetKey: 'scene',
     activeSchemaId: 'scene',
     trackerConnectionId: null,
@@ -218,9 +225,13 @@ export function deepMergeSettings(input, schemaPresets) {
         'snapshotHeader',
         'debugLogging',
     ]);
-    merged.schemaPresets = sanitizeSchemaPresetMap(schemaPresets ?? saved.schemaPresets);
-    merged.activeSchemaPresetKey = sanitizeId(readString(saved.activeSchemaPresetKey) || readString(saved.activeSchemaId) || merged.activeSchemaPresetKey) || 'scene';
-    merged.activeSchemaId = merged.activeSchemaPresetKey;
+    merged.schemaPresets = sanitizeSchemaPresetMap(schemaPresets ?? saved.schemaPresets, merged);
+    merged.activeTrackerPresetKey = sanitizeId(readString(saved.activeTrackerPresetKey)
+        || readString(saved.activeSchemaPresetKey)
+        || readString(saved.activeSchemaId)
+        || merged.activeTrackerPresetKey) || 'scene';
+    merged.activeSchemaPresetKey = merged.activeTrackerPresetKey;
+    merged.activeSchemaId = merged.activeTrackerPresetKey;
     merged.autoMode = normalizeAutoMode(saved.autoMode);
     merged.sequentialGeneration = readBool(saved.sequentialGeneration, readBool(saved.sequentialPartGeneration, merged.sequentialGeneration));
     merged.sequentialPartGeneration = merged.sequentialGeneration;
@@ -273,12 +284,14 @@ export function deepMergeSettings(input, schemaPresets) {
     merged.savedTrackerPromptId = normalizeNullableString(merged.savedTrackerPromptId);
     merged.trackerInstructionPrompt = merged.trackerInstructionPrompt || merged.extractionPrompt || DEFAULT_EXTRACTION_PROMPT;
     merged.extractionPrompt = merged.trackerInstructionPrompt;
-    if (!merged.schemaPresets[merged.activeSchemaPresetKey]) {
-        merged.activeSchemaPresetKey = Object.keys(merged.schemaPresets)[0] ?? 'scene';
-        merged.activeSchemaId = merged.activeSchemaPresetKey;
+    if (!merged.schemaPresets[merged.activeTrackerPresetKey]) {
+        merged.activeTrackerPresetKey = Object.keys(merged.schemaPresets)[0] ?? 'scene';
+        merged.activeSchemaPresetKey = merged.activeTrackerPresetKey;
+        merged.activeSchemaId = merged.activeTrackerPresetKey;
     }
-    if (!merged.schemaPresets[merged.activeSchemaPresetKey]) {
+    if (!merged.schemaPresets[merged.activeTrackerPresetKey]) {
         merged.schemaPresets = structuredClone(defaultSchemaPresets);
+        merged.activeTrackerPresetKey = 'scene';
         merged.activeSchemaPresetKey = 'scene';
         merged.activeSchemaId = 'scene';
     }
@@ -295,20 +308,20 @@ export function settingsForStorage(settings) {
     delete copy.extractionPrompt;
     return copy;
 }
-export function sanitizeSchemaPresetMap(input) {
+export function sanitizeSchemaPresetMap(input, promptDefaults = defaultSettings) {
     if (!isPlainObject(input))
         return structuredClone(defaultSchemaPresets);
     const out = {};
     for (const [fallbackKey, value] of Object.entries(input)) {
         if (!isPlainObject(value))
             continue;
-        const preset = normalizeSchemaPreset(value, fallbackKey);
+        const preset = normalizeSchemaPreset(value, fallbackKey, promptDefaults);
         if (preset)
             out[preset.key] = preset;
     }
     return Object.keys(out).length > 0 ? out : structuredClone(defaultSchemaPresets);
 }
-export function normalizeSchemaPreset(input, fallbackKey = 'schema') {
+export function normalizeSchemaPreset(input, fallbackKey = 'schema', promptDefaults = {}) {
     const value = isPlainObject(input) ? input : {};
     const key = sanitizeId(readString(value.key) || readString(value.id) || fallbackKey) || sanitizeId(fallbackKey) || 'schema';
     const schema = isPlainObject(value.jsonSchema)
@@ -317,8 +330,14 @@ export function normalizeSchemaPreset(input, fallbackKey = 'schema') {
             ? value.schema
             : DEFAULT_SCHEMA;
     const template = readString(value.renderTemplate) || readString(value.templateHtml) || DEFAULT_TEMPLATE_HTML;
+    const systemPrompt = readString(value.systemPrompt) || readString(promptDefaults.systemPrompt) || DEFAULT_SYSTEM_PROMPT;
+    const trackerInstructionPrompt = readString(value.trackerInstructionPrompt)
+        || readString(value.extractionPrompt)
+        || readString(promptDefaults.trackerInstructionPrompt)
+        || readString(promptDefaults.extractionPrompt)
+        || DEFAULT_EXTRACTION_PROMPT;
     const now = Date.now();
-    return {
+    const preset = {
         id: key,
         key,
         name: readString(value.name) || key,
@@ -327,12 +346,37 @@ export function normalizeSchemaPreset(input, fallbackKey = 'schema') {
         jsonSchema: schema,
         templateHtml: template,
         renderTemplate: template,
+        systemPrompt,
+        extractionPrompt: trackerInstructionPrompt,
+        trackerInstructionPrompt,
+        jsonPromptTemplate: readString(value.jsonPromptTemplate) || readString(promptDefaults.jsonPromptTemplate) || DEFAULT_JSON_PROMPT_TEMPLATE,
+        xmlPromptTemplate: readString(value.xmlPromptTemplate) || readString(promptDefaults.xmlPromptTemplate) || DEFAULT_XML_PROMPT_TEMPLATE,
+        toonPromptTemplate: readString(value.toonPromptTemplate) || readString(promptDefaults.toonPromptTemplate) || DEFAULT_TOON_PROMPT_TEMPLATE,
         createdAt: sanitizeInteger(value.createdAt, now, 0, Number.MAX_SAFE_INTEGER),
         updatedAt: sanitizeInteger(value.updatedAt, now, 0, Number.MAX_SAFE_INTEGER),
     };
+    const outputMode = normalizeOptionalStructuredOutputMode(value.structuredOutputMode);
+    if (outputMode)
+        preset.structuredOutputMode = outputMode;
+    return preset;
+}
+export function schemaPresetNeedsMigration(input) {
+    if (!isPlainObject(input))
+        return false;
+    const requiredFields = [
+        'systemPrompt',
+        'trackerInstructionPrompt',
+        'jsonPromptTemplate',
+        'xmlPromptTemplate',
+        'toonPromptTemplate',
+    ];
+    return Object.values(input).some((value) => (isPlainObject(value)
+        && requiredFields.some((field) => typeof value[field] !== 'string' || !value[field])));
 }
 export function getSchemaPreset(settings, preferredId) {
-    const key = preferredId && settings.schemaPresets[preferredId] ? preferredId : settings.activeSchemaPresetKey;
+    const key = preferredId && settings.schemaPresets[preferredId]
+        ? preferredId
+        : settings.activeTrackerPresetKey || settings.activeSchemaPresetKey;
     return settings.schemaPresets[key] ?? settings.schemaPresets[Object.keys(settings.schemaPresets)[0]];
 }
 export function getTopLevelSchemaKeys(schema) {
@@ -515,6 +559,11 @@ function normalizeStructuredOutputMode(value) {
     if (value === 'json')
         return 'json_prompt';
     return normalizeEnum(value, ['native_json_schema', 'json_prompt', 'xml_prompt', 'toon_prompt'], 'json_prompt');
+}
+function normalizeOptionalStructuredOutputMode(value) {
+    if (value === undefined || value === null || value === '')
+        return undefined;
+    return normalizeStructuredOutputMode(value);
 }
 function normalizeEnum(value, allowed, fallback) {
     return typeof value === 'string' && allowed.includes(value) ? value : fallback;
