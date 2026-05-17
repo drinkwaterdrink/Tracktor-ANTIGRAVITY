@@ -684,7 +684,6 @@ function setup(ctx) {
         const action = btn.getAttribute("data-action");
         if (action === "generate_tracker") {
           sendBackend({ type: "generate_tracker" });
-          placement.activate();
         } else if (action === "cancel_job") {
           sendBackend({ type: "cancel_job", jobId: btn.getAttribute("data-job-id") ?? void 0 });
         }
@@ -1701,30 +1700,22 @@ function scheduleWidgetTopRelocation() {
 }
 function relocateWidgetsToTop() {
   if (!state?.activeChat) return;
-  let relocated = false;
-  for (const tracker of state.activeChat.trackers) {
-    const selectors = [
-      `[data-message-id="${tracker.messageId}"] [data-widget-id="tracktor-tracker"]`,
-      `[data-message-id="${tracker.messageId}"] .spindle-widget-tracktor-tracker`,
-      `[data-message-id="${tracker.messageId}"] iframe[data-widget="tracktor-tracker"]`
-    ];
-    for (const selector of selectors) {
-      try {
-        const widget = document.querySelector(selector);
-        if (!widget) continue;
-        const messageContainer = widget.closest(`[data-message-id="${tracker.messageId}"]`);
-        if (!messageContainer) continue;
-        const firstChild = messageContainer.firstElementChild;
-        if (firstChild && firstChild !== widget && widget.parentElement === messageContainer) {
-          messageContainer.insertBefore(widget, firstChild);
-          relocated = true;
-        }
-        break;
-      } catch {
+  const widgets = Array.from(document.querySelectorAll('iframe, [data-widget-id], [class*="widget"]'));
+  for (const widget of widgets) {
+    const isTracktor = widget.getAttribute("data-widget-id")?.includes("tracktor") || widget.getAttribute("name")?.includes("tracktor") || widget.getAttribute("src")?.includes("tracktor") || widget.className.includes("tracktor");
+    if (!isTracktor) continue;
+    const widgetWrapper = widget.closest(".spindle-widget, .widget-container, [data-widget-wrapper]") || widget;
+    const messageContainer = widgetWrapper.closest('.message, [data-message-id], .chat-message, [class*="message"]');
+    if (messageContainer) {
+      if (messageContainer.firstElementChild && messageContainer.firstElementChild !== widgetWrapper) {
+        messageContainer.insertBefore(widgetWrapper, messageContainer.firstElementChild);
+      }
+    } else {
+      const grandParent = widgetWrapper.parentElement;
+      if (grandParent && grandParent.firstElementChild && grandParent.firstElementChild !== widgetWrapper) {
+        grandParent.insertBefore(widgetWrapper, grandParent.firstElementChild);
       }
     }
-  }
-  if (!relocated && state.activeChat.trackers.length > 0) {
   }
 }
 function cleanupWidgetTopObserver() {

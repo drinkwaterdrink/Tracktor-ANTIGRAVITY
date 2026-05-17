@@ -123,7 +123,6 @@ export function setup(ctx: SpindleFrontendContext) {
         const action = btn.getAttribute('data-action');
         if (action === 'generate_tracker') {
           sendBackend({ type: 'generate_tracker' });
-          placement.activate();
         } else if (action === 'cancel_job') {
           sendBackend({ type: 'cancel_job', jobId: btn.getAttribute('data-job-id') ?? undefined });
         }
@@ -1290,37 +1289,36 @@ function scheduleWidgetTopRelocation(): void {
 
 function relocateWidgetsToTop(): void {
   if (!state?.activeChat) return;
-  let relocated = false;
-  for (const tracker of state.activeChat.trackers) {
-    // Find the widget container for this message
-    // Lumiverse widget containers typically use data attributes or known selectors
-    const selectors = [
-      `[data-message-id="${tracker.messageId}"] [data-widget-id="tracktor-tracker"]`,
-      `[data-message-id="${tracker.messageId}"] .spindle-widget-tracktor-tracker`,
-      `[data-message-id="${tracker.messageId}"] iframe[data-widget="tracktor-tracker"]`,
-    ];
-    for (const selector of selectors) {
-      try {
-        const widget = document.querySelector(selector);
-        if (!widget) continue;
-        const messageContainer = widget.closest(`[data-message-id="${tracker.messageId}"]`);
-        if (!messageContainer) continue;
-        // Find the first child that isn't the widget itself
-        const firstChild = messageContainer.firstElementChild;
-        if (firstChild && firstChild !== widget && widget.parentElement === messageContainer) {
-          messageContainer.insertBefore(widget, firstChild);
-          relocated = true;
-        }
-        break;
-      } catch {
-        // Selector or DOM manipulation failed — skip
+  
+  // Find all possible widget elements
+  const widgets = Array.from(document.querySelectorAll('iframe, [data-widget-id], [class*="widget"]'));
+  
+  for (const widget of widgets) {
+    const isTracktor = 
+      widget.getAttribute('data-widget-id')?.includes('tracktor') || 
+      widget.getAttribute('name')?.includes('tracktor') || 
+      widget.getAttribute('src')?.includes('tracktor') ||
+      widget.className.includes('tracktor');
+      
+    if (!isTracktor) continue;
+    
+    // Find the widget wrapper (if the host wraps the iframe in a div)
+    const widgetWrapper = widget.closest('.spindle-widget, .widget-container, [data-widget-wrapper]') || widget;
+    
+    // Find the message container
+    const messageContainer = widgetWrapper.closest('.message, [data-message-id], .chat-message, [class*="message"]');
+    
+    if (messageContainer) {
+      if (messageContainer.firstElementChild && messageContainer.firstElementChild !== widgetWrapper) {
+        messageContainer.insertBefore(widgetWrapper, messageContainer.firstElementChild);
+      }
+    } else {
+      // Fallback: If no message container found, just move the widget wrapper to be the first child of its parent
+      const grandParent = widgetWrapper.parentElement;
+      if (grandParent && grandParent.firstElementChild && grandParent.firstElementChild !== widgetWrapper) {
+        grandParent.insertBefore(widgetWrapper, grandParent.firstElementChild);
       }
     }
-  }
-  // If we never found anything to relocate and haven't warned yet, it's fine —
-  // the host may just not expose message containers in a way we can traverse.
-  if (!relocated && state.activeChat.trackers.length > 0) {
-    // Widgets are still rendered (just at bottom), which is acceptable fallback.
   }
 }
 
