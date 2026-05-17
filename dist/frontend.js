@@ -1,7 +1,25 @@
 // src/shared.ts
-var VERSION = "0.1.2";
+var VERSION = "0.2.0";
 var DEFAULT_SYSTEM_PROMPT = `You are a structured tracker extraction assistant. Analyze the conversation and return only tracker data that matches the requested schema. Do not roleplay, continue the scene, explain yourself, or include markdown unless the tracker format instructions explicitly ask for it. Preserve continuity with previous tracker snapshots, but update the tracker from the newest chat evidence.`;
 var DEFAULT_EXTRACTION_PROMPT = `Create a complete tracker update for the target message. Fill every required field. If a field is not explicitly stated, infer a short, reasonable value from the conversation context. Keep values concise and concrete.`;
+var DEFAULT_JSON_PROMPT_TEMPLATE = [
+  "Return only one valid JSON object.",
+  "Do not include markdown fences, commentary, or prose outside JSON.",
+  "The object must conform to this JSON Schema:",
+  "{{schema}}",
+  "Example shape:",
+  "{{example_response}}"
+].join("\n\n");
+var DEFAULT_XML_PROMPT_TEMPLATE = [
+  "Return tracker data as valid JSON even if the model was asked for XML-style structure.",
+  "Use this schema as the authority:",
+  "{{schema}}"
+].join("\n\n");
+var DEFAULT_TOON_PROMPT_TEMPLATE = [
+  "Return tracker data as valid JSON. Keep values compact like TOON, but the response must still parse as JSON.",
+  "Use this schema as the authority:",
+  "{{schema}}"
+].join("\n\n");
 var DEFAULT_SCHEMA = {
   $schema: "http://json-schema.org/draft-07/schema#",
   title: "SceneTracker",
@@ -76,26 +94,84 @@ var DEFAULT_TEMPLATE_HTML = `
   </details>
 </section>
 `.trim();
+var defaultSchemaPresets = {
+  scene: normalizeSchemaPreset({
+    key: "scene",
+    id: "scene",
+    name: "Scene Tracker",
+    description: "General roleplay scene state.",
+    jsonSchema: DEFAULT_SCHEMA,
+    schema: DEFAULT_SCHEMA,
+    renderTemplate: DEFAULT_TEMPLATE_HTML,
+    templateHtml: DEFAULT_TEMPLATE_HTML
+  }, "scene")
+};
+var defaultSnapshotTransformPresets = {
+  default_json: {
+    key: "default_json",
+    name: "Default JSON",
+    input: "pretty_json",
+    regexPattern: "",
+    regexFlags: "",
+    replacement: "",
+    codeFenceLang: "json",
+    wrapInCodeFence: true
+  },
+  minimal: {
+    key: "minimal",
+    name: "Minimal Lines",
+    input: "top_level_lines",
+    regexPattern: "",
+    regexFlags: "",
+    replacement: "",
+    codeFenceLang: "",
+    wrapInCodeFence: false
+  },
+  toon: {
+    key: "toon",
+    name: "TOON",
+    input: "toon",
+    regexPattern: "",
+    regexFlags: "",
+    replacement: "",
+    codeFenceLang: "toon",
+    wrapInCodeFence: true
+  }
+};
 var defaultSettings = {
   version: VERSION,
+  schemaPresets: structuredClone(defaultSchemaPresets),
+  activeSchemaPresetKey: "scene",
   activeSchemaId: "scene",
-  schemaPresets: {
-    scene: {
-      id: "scene",
-      name: "Scene Tracker",
-      description: "General roleplay scene state.",
-      schema: DEFAULT_SCHEMA,
-      templateHtml: DEFAULT_TEMPLATE_HTML
-    }
-  },
-  generationMode: "json",
-  maxResponseTokens: 1800,
+  trackerConnectionId: null,
+  trackerPresetId: null,
+  autoMode: "none",
+  sequentialGeneration: false,
+  sequentialPartGeneration: false,
+  maxResponseTokens: 4096,
+  skipFirstMessages: 0,
+  trackerContextMessageLimit: 12,
   includeLastMessages: 12,
   includeLastTrackers: 1,
-  sequentialPartGeneration: false,
-  autoMode: "off",
+  includeCharacterCardInTrackerPrompt: false,
+  trackerConversationRoleMode: "preserve",
+  structuredOutputMode: "json_prompt",
+  generationMode: "json",
   systemPrompt: DEFAULT_SYSTEM_PROMPT,
   extractionPrompt: DEFAULT_EXTRACTION_PROMPT,
+  trackerInstructionPrompt: DEFAULT_EXTRACTION_PROMPT,
+  jsonPromptTemplate: DEFAULT_JSON_PROMPT_TEMPLATE,
+  xmlPromptTemplate: DEFAULT_XML_PROMPT_TEMPLATE,
+  toonPromptTemplate: DEFAULT_TOON_PROMPT_TEMPLATE,
+  trackerSystemPromptSource: "saved_tracker_prompt",
+  savedTrackerPromptId: null,
+  injectTrackerSnapshots: true,
+  trackerSnapshotCount: 1,
+  snapshotRole: "system",
+  injectAsVirtualCharacter: false,
+  snapshotHeader: "Recent tracker snapshot",
+  snapshotTransformPresetKey: "default_json",
+  snapshotTransformPresets: structuredClone(defaultSnapshotTransformPresets),
   injection: {
     enabled: true,
     includeLastTrackers: 1,
@@ -106,64 +182,132 @@ var defaultSettings = {
     enabled: true,
     key: "tracktor"
   },
+  trackerWorldBookMode: "include_all",
+  allowedWorldBookIds: [],
+  allowedWorldBookEntryIds: [],
   debugLogging: false
 };
-function deepMergeSettings(input) {
+function deepMergeSettings(input, schemaPresets) {
   const saved = isPlainObject(input) ? input : {};
   const merged = structuredClone(defaultSettings);
   assignKnown(merged, saved, [
     "version",
-    "activeSchemaId",
-    "generationMode",
+    "trackerConnectionId",
+    "trackerPresetId",
     "maxResponseTokens",
+    "skipFirstMessages",
+    "trackerContextMessageLimit",
     "includeLastMessages",
     "includeLastTrackers",
-    "sequentialPartGeneration",
-    "autoMode",
+    "includeCharacterCardInTrackerPrompt",
     "systemPrompt",
     "extractionPrompt",
+    "trackerInstructionPrompt",
+    "jsonPromptTemplate",
+    "xmlPromptTemplate",
+    "toonPromptTemplate",
+    "trackerSystemPromptSource",
+    "savedTrackerPromptId",
+    "injectTrackerSnapshots",
+    "trackerSnapshotCount",
+    "injectAsVirtualCharacter",
+    "snapshotHeader",
     "debugLogging"
   ]);
-  if (isPlainObject(saved.schemaPresets)) {
-    merged.schemaPresets = {};
-    for (const [id, value] of Object.entries(saved.schemaPresets)) {
-      if (!isPlainObject(value)) continue;
-      const preset = value;
-      if (!isPlainObject(preset.schema) || typeof preset.templateHtml !== "string") continue;
-      const normalizedId = sanitizeId(typeof preset.id === "string" ? preset.id : id) || id;
-      merged.schemaPresets[normalizedId] = {
-        id: normalizedId,
-        name: typeof preset.name === "string" && preset.name.trim() ? preset.name : normalizedId,
-        description: typeof preset.description === "string" ? preset.description : void 0,
-        schema: preset.schema,
-        templateHtml: preset.templateHtml
-      };
-    }
-    if (Object.keys(merged.schemaPresets).length === 0) {
-      merged.schemaPresets = structuredClone(defaultSettings.schemaPresets);
-    }
+  merged.schemaPresets = sanitizeSchemaPresetMap(schemaPresets ?? saved.schemaPresets);
+  merged.activeSchemaPresetKey = sanitizeId(readString(saved.activeSchemaPresetKey) || readString(saved.activeSchemaId) || merged.activeSchemaPresetKey) || "scene";
+  merged.activeSchemaId = merged.activeSchemaPresetKey;
+  merged.autoMode = normalizeAutoMode(saved.autoMode);
+  merged.sequentialGeneration = readBool(saved.sequentialGeneration, readBool(saved.sequentialPartGeneration, merged.sequentialGeneration));
+  merged.sequentialPartGeneration = merged.sequentialGeneration;
+  merged.structuredOutputMode = normalizeStructuredOutputMode(saved.structuredOutputMode ?? saved.generationMode);
+  merged.generationMode = merged.structuredOutputMode === "native_json_schema" ? "native_json" : "json";
+  merged.trackerConversationRoleMode = normalizeEnum(saved.trackerConversationRoleMode, ["preserve", "all_assistant", "plain_transcript"], "preserve");
+  merged.snapshotRole = normalizeEnum(saved.snapshotRole, ["system", "user", "assistant"], "system");
+  merged.trackerWorldBookMode = normalizeEnum(saved.trackerWorldBookMode, ["include_all", "exclude_all", "allowlist"], "include_all");
+  merged.snapshotTransformPresetKey = normalizeEnum(saved.snapshotTransformPresetKey, ["default_json", "minimal", "toon", "custom"], "default_json");
+  merged.allowedWorldBookIds = sanitizeStringArray(saved.allowedWorldBookIds);
+  merged.allowedWorldBookEntryIds = sanitizeStringArray(saved.allowedWorldBookEntryIds);
+  if (saved.trackerContextMessageLimit === void 0 && saved.includeLastMessages !== void 0) {
+    merged.trackerContextMessageLimit = saved.includeLastMessages;
+  }
+  if (saved.trackerInstructionPrompt === void 0 && typeof saved.extractionPrompt === "string") {
+    merged.trackerInstructionPrompt = saved.extractionPrompt;
+  }
+  if (isPlainObject(saved.snapshotTransformPresets)) {
+    merged.snapshotTransformPresets = {
+      ...structuredClone(defaultSnapshotTransformPresets),
+      ...sanitizeSnapshotTransformPresets(saved.snapshotTransformPresets)
+    };
   }
   if (isPlainObject(saved.injection)) {
-    assignKnown(merged.injection, saved.injection, [
-      "enabled",
-      "includeLastTrackers",
-      "role",
-      "header"
-    ]);
+    const injection = saved.injection;
+    merged.injectTrackerSnapshots = readBool(injection.enabled, merged.injectTrackerSnapshots);
+    merged.trackerSnapshotCount = sanitizeInteger(injection.includeLastTrackers, merged.trackerSnapshotCount, 0, 25);
+    merged.snapshotRole = normalizeEnum(injection.role, ["system", "user", "assistant"], merged.snapshotRole);
+    merged.snapshotHeader = readString(injection.header) || merged.snapshotHeader;
   }
   if (isPlainObject(saved.chatVariableExport)) {
     assignKnown(merged.chatVariableExport, saved.chatVariableExport, ["enabled", "key"]);
   }
-  merged.activeSchemaId = merged.schemaPresets[merged.activeSchemaId] ? merged.activeSchemaId : Object.keys(merged.schemaPresets)[0];
-  merged.maxResponseTokens = sanitizeInteger(merged.maxResponseTokens, 1800, 1, 64e3);
-  merged.includeLastMessages = sanitizeInteger(merged.includeLastMessages, 12, 1, 200);
+  merged.maxResponseTokens = sanitizeInteger(merged.maxResponseTokens, 4096, 1, 64e3);
+  merged.skipFirstMessages = sanitizeInteger(merged.skipFirstMessages, 0, 0, 1e3);
+  merged.trackerContextMessageLimit = sanitizeInteger(merged.trackerContextMessageLimit, merged.includeLastMessages, 0, 400);
+  merged.includeLastMessages = merged.trackerContextMessageLimit;
   merged.includeLastTrackers = sanitizeInteger(merged.includeLastTrackers, 1, 0, 25);
-  merged.injection.includeLastTrackers = sanitizeInteger(merged.injection.includeLastTrackers, 1, 0, 25);
-  merged.generationMode = merged.generationMode === "native_json" ? "native_json" : "json";
-  merged.autoMode = ["off", "assistant_message", "user_message"].includes(merged.autoMode) ? merged.autoMode : "off";
-  merged.injection.role = ["system", "user", "assistant"].includes(merged.injection.role) ? merged.injection.role : "system";
-  merged.chatVariableExport.key = sanitizeVariableKey(merged.chatVariableExport.key) || "tracktor";
+  merged.trackerSnapshotCount = sanitizeInteger(merged.trackerSnapshotCount, 1, 0, 25);
+  merged.injection = {
+    enabled: merged.injectTrackerSnapshots,
+    includeLastTrackers: merged.trackerSnapshotCount,
+    role: merged.snapshotRole,
+    header: merged.snapshotHeader
+  };
+  merged.chatVariableExport.enabled = readBool(merged.chatVariableExport.enabled, true);
+  merged.chatVariableExport.key = sanitizeVariableKey(String(merged.chatVariableExport.key ?? "tracktor")) || "tracktor";
+  merged.trackerConnectionId = normalizeNullableString(merged.trackerConnectionId);
+  merged.trackerPresetId = normalizeNullableString(merged.trackerPresetId);
+  merged.savedTrackerPromptId = normalizeNullableString(merged.savedTrackerPromptId);
+  merged.trackerInstructionPrompt = merged.trackerInstructionPrompt || merged.extractionPrompt || DEFAULT_EXTRACTION_PROMPT;
+  merged.extractionPrompt = merged.trackerInstructionPrompt;
+  if (!merged.schemaPresets[merged.activeSchemaPresetKey]) {
+    merged.activeSchemaPresetKey = Object.keys(merged.schemaPresets)[0] ?? "scene";
+    merged.activeSchemaId = merged.activeSchemaPresetKey;
+  }
+  if (!merged.schemaPresets[merged.activeSchemaPresetKey]) {
+    merged.schemaPresets = structuredClone(defaultSchemaPresets);
+    merged.activeSchemaPresetKey = "scene";
+    merged.activeSchemaId = "scene";
+  }
   return merged;
+}
+function sanitizeSchemaPresetMap(input) {
+  if (!isPlainObject(input)) return structuredClone(defaultSchemaPresets);
+  const out = {};
+  for (const [fallbackKey, value] of Object.entries(input)) {
+    if (!isPlainObject(value)) continue;
+    const preset = normalizeSchemaPreset(value, fallbackKey);
+    if (preset) out[preset.key] = preset;
+  }
+  return Object.keys(out).length > 0 ? out : structuredClone(defaultSchemaPresets);
+}
+function normalizeSchemaPreset(input, fallbackKey = "schema") {
+  const value = isPlainObject(input) ? input : {};
+  const key = sanitizeId(readString(value.key) || readString(value.id) || fallbackKey) || sanitizeId(fallbackKey) || "schema";
+  const schema = isPlainObject(value.jsonSchema) ? value.jsonSchema : isPlainObject(value.schema) ? value.schema : DEFAULT_SCHEMA;
+  const template = readString(value.renderTemplate) || readString(value.templateHtml) || DEFAULT_TEMPLATE_HTML;
+  const now = Date.now();
+  return {
+    id: key,
+    key,
+    name: readString(value.name) || key,
+    description: readString(value.description) || void 0,
+    schema,
+    jsonSchema: schema,
+    templateHtml: template,
+    renderTemplate: template,
+    createdAt: sanitizeInteger(value.createdAt, now, 0, Number.MAX_SAFE_INTEGER),
+    updatedAt: sanitizeInteger(value.updatedAt, now, 0, Number.MAX_SAFE_INTEGER)
+  };
 }
 function safePreview(value, max = 160) {
   const compact = value.replace(/\s+/g, " ").trim();
@@ -185,12 +329,57 @@ function sanitizeVariableKey(value) {
 function isPlainObject(value) {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
+function sanitizeSnapshotTransformPresets(input) {
+  const out = {};
+  for (const [key, raw] of Object.entries(input)) {
+    if (!isPlainObject(raw)) continue;
+    const presetKey = normalizeEnum(raw.key ?? key, ["default_json", "minimal", "toon", "custom"], "custom");
+    out[key] = {
+      key: presetKey,
+      name: readString(raw.name) || key,
+      input: normalizeEnum(raw.input, ["pretty_json", "top_level_lines", "toon"], "pretty_json"),
+      regexPattern: readString(raw.regexPattern),
+      regexFlags: readString(raw.regexFlags),
+      replacement: readString(raw.replacement),
+      codeFenceLang: readString(raw.codeFenceLang),
+      wrapInCodeFence: readBool(raw.wrapInCodeFence, presetKey !== "minimal")
+    };
+  }
+  return out;
+}
+function normalizeAutoMode(value) {
+  if (value === "off") return "none";
+  if (value === "assistant_message") return "responses";
+  if (value === "user_message") return "inputs";
+  return normalizeEnum(value, ["none", "responses", "inputs", "both"], "none");
+}
+function normalizeStructuredOutputMode(value) {
+  if (value === "native_json") return "native_json_schema";
+  if (value === "json") return "json_prompt";
+  return normalizeEnum(value, ["native_json_schema", "json_prompt", "xml_prompt", "toon_prompt"], "json_prompt");
+}
+function normalizeEnum(value, allowed, fallback) {
+  return typeof value === "string" && allowed.includes(value) ? value : fallback;
+}
+function normalizeNullableString(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+function sanitizeStringArray(value) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => typeof item === "string" && item.trim() ? [item.trim()] : []);
+}
+function readString(value) {
+  return typeof value === "string" ? value : "";
+}
+function readBool(value, fallback) {
+  return typeof value === "boolean" ? value : fallback;
+}
 function assignKnown(target, source, keys) {
   const writable = target;
   for (const key of keys) {
-    if (source[key] !== void 0) {
-      writable[key] = source[key];
-    }
+    if (source[key] !== void 0) writable[key] = source[key];
   }
 }
 function sanitizeInteger(value, fallback, min, max) {
@@ -203,6 +392,7 @@ function sanitizeInteger(value, fallback, min, max) {
 var state;
 var roots = [];
 var ctxRef;
+var lastKnownChatId = null;
 var widgetCleanups = /* @__PURE__ */ new Map();
 function setup(ctx) {
   ctxRef = ctx;
@@ -211,6 +401,7 @@ function setup(ctx) {
   const settingsRoot = tryCreateSettingsRoot(ctx);
   roots = uniqueRoots([placement.root, settingsRoot].filter((value) => !!value));
   roots.forEach((root) => root.classList.add("tracktor-root"));
+  render();
   const openAction = ctx.ui?.registerInputBarAction?.({
     id: "open-tracktor",
     label: "Open Tracktor",
@@ -219,7 +410,7 @@ function setup(ctx) {
   });
   const unbindOpenAction = openAction?.onClick(() => {
     placement.activate();
-    ctx.sendToBackend({ type: "get_state" });
+    sendBackend({ type: "refresh_state" });
   });
   const inputAction = ctx.ui?.registerInputBarAction?.({
     id: "generate-latest-tracker",
@@ -228,26 +419,58 @@ function setup(ctx) {
     iconSvg: TRACKTOR_SMALL_ICON
   });
   const unbindInputAction = inputAction?.onClick(() => {
-    ctx.sendToBackend({ type: "generate_tracker" });
+    sendBackend({ type: "generate_tracker" });
     placement.activate();
+  });
+  const toggleInjectionAction = ctx.ui?.registerInputBarAction?.({
+    id: "toggle-tracktor-injection",
+    label: "Toggle Tracker Injection",
+    enabled: true,
+    iconSvg: TRACKTOR_SMALL_ICON
+  });
+  const unbindToggleInjectionAction = toggleInjectionAction?.onClick(() => {
+    sendBackend({ type: "toggle_injection" });
   });
   const unbindBackend = ctx.onBackendMessage((payload) => {
     if (payload?.type === "state") {
       state = payload.state;
+      lastKnownChatId = state?.activeChat?.id ?? lastKnownChatId;
       placement.setBadge(state?.activeChat?.trackers.length ? String(state.activeChat.trackers.length) : null);
       render();
       renderMessageWidgets();
+    } else if (payload?.type === "diagnostic") {
+      if (!state) return;
+      state.diagnostics = [String(payload.message ?? "Diagnostic"), ...state.diagnostics ?? []].slice(0, 12);
+      render();
+    } else if (payload?.type === "job_started" || payload?.type === "job_progress" || payload?.type === "job_finished" || payload?.type === "job_failed") {
+      sendBackend({ type: "refresh_state" });
     }
   });
   const unbindActivate = placement.onActivate(() => {
-    ctx.sendToBackend({ type: "get_state" });
+    sendBackend({ type: "refresh_state" });
+  });
+  const eventCleanups = [
+    "CHAT_CHANGED",
+    "CHAT_SWITCHED",
+    "MESSAGE_SENT",
+    "MESSAGE_EDITED",
+    "MESSAGE_DELETED",
+    "MESSAGE_SWIPED",
+    "GENERATION_ENDED"
+  ].flatMap((eventName) => {
+    if (!ctx.events?.on) return [];
+    return [ctx.events.on(eventName, (payload) => {
+      const chatId = readChatId(payload);
+      if (typeof chatId !== "undefined") lastKnownChatId = chatId;
+      sendBackend({ type: "refresh_state", chatId: chatId ?? lastKnownChatId ?? void 0 });
+    })];
   });
   roots.forEach((root) => {
     root.addEventListener("click", handleClick);
     root.addEventListener("change", handleChange);
     root.addEventListener("input", handleInput);
   });
-  ctx.sendToBackend({ type: "get_state" });
+  sendBackend({ type: "ready" });
   return () => {
     roots.forEach((root) => {
       root.removeEventListener("click", handleClick);
@@ -261,8 +484,11 @@ function setup(ctx) {
     inputAction?.destroy();
     unbindOpenAction?.();
     openAction?.destroy();
+    unbindToggleInjectionAction?.();
+    toggleInjectionAction?.destroy();
     unbindActivate();
     unbindBackend();
+    eventCleanups.forEach((cleanup) => cleanup());
     placement.destroy();
     removeStyle();
     ctx.dom.cleanup();
@@ -271,22 +497,51 @@ function setup(ctx) {
 function createPlacement(ctx) {
   const drawerTab = tryCreateDrawerTab(ctx);
   if (drawerTab) {
-    const cleanupLauncher = createFloatingLauncher(ctx, () => drawerTab.activate());
     return {
       root: drawerTab.root,
       activate: drawerTab.activate,
       setBadge(text) {
         drawerTab.setBadge(text);
-        cleanupLauncher.setBadge(text);
       },
       onActivate: drawerTab.onActivate,
       destroy() {
-        cleanupLauncher.destroy();
         drawerTab.destroy();
       }
     };
   }
   return createFallbackPanel(ctx);
+}
+function sendBackend(payload) {
+  const chatId = payload.chatId ?? getActiveChatId();
+  if (typeof chatId === "string" && chatId) {
+    lastKnownChatId = chatId;
+    ctxRef.sendToBackend({ ...payload, chatId });
+    return;
+  }
+  ctxRef.sendToBackend(payload);
+}
+function getActiveChatId() {
+  try {
+    const active = ctxRef.getActiveChat?.();
+    const chatId = active?.chatId ?? active?.id ?? lastKnownChatId ?? void 0;
+    return typeof chatId === "string" && chatId ? chatId : void 0;
+  } catch {
+    return lastKnownChatId ?? void 0;
+  }
+}
+function readChatId(payload) {
+  if (!payload || typeof payload !== "object") return void 0;
+  const obj = payload;
+  if (typeof obj.chatId === "string") return obj.chatId;
+  if (typeof obj.chat_id === "string") return obj.chat_id;
+  if (obj.chatId === null || obj.chat_id === null) return null;
+  const message = obj.message;
+  if (message && typeof message === "object") {
+    const nested = message;
+    if (typeof nested.chatId === "string") return nested.chatId;
+    if (typeof nested.chat_id === "string") return nested.chat_id;
+  }
+  return void 0;
 }
 function tryCreateDrawerTab(ctx) {
   if (typeof ctx.ui?.registerDrawerTab !== "function") {
@@ -313,30 +568,6 @@ function tryCreateDrawerTab(ctx) {
     console.warn("Tracktor: drawer tab registration failed, falling back to a fixed launcher panel.", error);
     return void 0;
   }
-}
-function createFloatingLauncher(ctx, activate) {
-  const launcher = injectHostElement(
-    ctx,
-    "body",
-    `<button type="button" class="tracktor-floating-launcher" title="Open Tracktor">${TRACKTOR_SMALL_ICON}<span>Tracktor</span></button>`
-  );
-  const button = launcher.matches(".tracktor-floating-launcher") ? launcher : launcher.querySelector(".tracktor-floating-launcher");
-  const onClick = () => {
-    activate();
-    ctx.sendToBackend({ type: "get_state" });
-  };
-  button?.addEventListener("click", onClick);
-  return {
-    setBadge(text) {
-      if (!button) return;
-      button.setAttribute("data-tracktor-badge", text ?? "");
-      button.classList.toggle("has-tracktor-badge", !!text);
-    },
-    destroy() {
-      button?.removeEventListener("click", onClick);
-      launcher.remove();
-    }
-  };
 }
 function createFallbackPanel(ctx) {
   const shell = injectHostElement(
@@ -444,11 +675,29 @@ function render() {
   if (roots.length === 0) return;
   for (const root of roots) {
     if (!state) {
-      root.innerHTML = '<div class="tracktor-empty">Loading Tracktor...</div>';
+      root.innerHTML = `
+        <div class="tracktor-shell">
+          ${renderHeader()}
+          <section class="tracktor-section tracktor-toolbar">
+            <div>
+              <strong>Connecting to Tracktor</strong>
+              <span>The backend state has not arrived yet. You can still refresh or open extension settings.</span>
+            </div>
+            <div class="tracktor-actions">
+              <button type="button" data-action="refresh">Refresh</button>
+              <button type="button" data-action="open-extension-settings">Extension Settings</button>
+            </div>
+          </section>
+          <div class="tracktor-empty">Loading Tracktor state...</div>
+          ${renderSettings(defaultSettings)}
+          ${renderSchemaEditor(defaultSettings)}
+        </div>
+      `;
       continue;
     }
     root.innerHTML = `
       <div class="tracktor-shell">
+        ${renderHeader()}
         ${renderStatus(state)}
         ${renderToolbar(state)}
         ${renderTrackers(state)}
@@ -458,11 +707,28 @@ function render() {
     `;
   }
 }
+function renderHeader() {
+  return `
+    <header class="tracktor-header">
+      <div>
+        <strong>Tracktor</strong>
+        <span>Schema tracker snapshots for Lumiverse chats</span>
+      </div>
+      <div class="tracktor-tabs" aria-label="Tracktor sections">
+        <span>Current</span>
+        <span>Settings</span>
+        <span>Schema</span>
+        <span>Diagnostics</span>
+      </div>
+    </header>
+  `;
+}
 function renderStatus(current) {
   const warnings = current.permissionWarnings.length ? `<div class="tracktor-warning">Grant permissions in Lumiverse Extensions: ${current.permissionWarnings.map(escapeHtml).join(", ")}</div>` : "";
   const error = current.lastError ? `<div class="tracktor-error">${escapeHtml(current.lastError)}</div>` : "";
-  const busy = current.busy ? '<div class="tracktor-busy">Working...</div>' : "";
-  return `${warnings}${error}${busy}`;
+  const jobs = current.jobs?.length ? `<div class="tracktor-busy">${current.jobs.map((job) => `${escapeHtml(job.label)}${job.totalParts ? ` ${job.currentPart ?? 0}/${job.totalParts}` : ""}`).join("<br>")}</div>` : current.busy ? '<div class="tracktor-busy">Working...</div>' : "";
+  const diagnostics = current.diagnostics?.length ? `<details class="tracktor-diagnostics"><summary>Diagnostics</summary>${current.diagnostics.map((item) => `<p>${escapeHtml(item)}</p>`).join("")}</details>` : "";
+  return `${warnings}${error}${jobs}${diagnostics}`;
 }
 function renderToolbar(current) {
   const chat = current.activeChat;
@@ -498,6 +764,7 @@ function renderTrackers(current) {
   `;
 }
 function renderTrackerItem(item) {
+  const partButtons = (item.snapshot.partsOrder ?? []).map((partKey) => `<button type="button" data-action="regenerate-part" data-chat-id="${escapeHtml(item.chatId)}" data-message-id="${escapeHtml(item.messageId)}" data-part-key="${escapeHtml(partKey)}">${escapeHtml(partKey)}</button>`).join("");
   return `
     <article class="tracktor-item" data-chat-id="${escapeHtml(item.chatId)}" data-message-id="${escapeHtml(item.messageId)}">
       <div class="tracktor-item-head">
@@ -511,6 +778,7 @@ function renderTrackerItem(item) {
           <button type="button" data-action="delete" data-chat-id="${escapeHtml(item.chatId)}" data-message-id="${escapeHtml(item.messageId)}">Delete</button>
         </div>
       </div>
+      ${partButtons ? `<details class="tracktor-parts"><summary>Regenerate section</summary><div class="tracktor-actions">${partButtons}</div></details>` : ""}
       <div class="tracktor-rendered">${stripDangerousHtml(item.tracker.renderedHtml)}</div>
     </article>
   `;
@@ -520,21 +788,33 @@ function renderSettings(settings) {
     <section class="tracktor-section">
       <h2>Settings</h2>
       <div class="tracktor-form-grid">
-        <label>Generation mode
-          <select data-setting="generationMode">
-            <option value="json" ${settings.generationMode === "json" ? "selected" : ""}>Prompted JSON</option>
-            <option value="native_json" ${settings.generationMode === "native_json" ? "selected" : ""}>Native JSON schema</option>
+        <label>Structured output
+          <select data-setting="structuredOutputMode">
+            <option value="json_prompt" ${settings.structuredOutputMode === "json_prompt" ? "selected" : ""}>Prompted JSON</option>
+            <option value="native_json_schema" ${settings.structuredOutputMode === "native_json_schema" ? "selected" : ""}>Native JSON schema</option>
+            <option value="xml_prompt" ${settings.structuredOutputMode === "xml_prompt" ? "selected" : ""}>XML prompt fallback</option>
+            <option value="toon_prompt" ${settings.structuredOutputMode === "toon_prompt" ? "selected" : ""}>TOON prompt fallback</option>
           </select>
         </label>
         <label>Auto mode
           <select data-setting="autoMode">
-            <option value="off" ${settings.autoMode === "off" ? "selected" : ""}>Off</option>
-            <option value="assistant_message" ${settings.autoMode === "assistant_message" ? "selected" : ""}>After assistant messages</option>
-            <option value="user_message" ${settings.autoMode === "user_message" ? "selected" : ""}>After user messages</option>
+            <option value="none" ${settings.autoMode === "none" ? "selected" : ""}>None</option>
+            <option value="responses" ${settings.autoMode === "responses" ? "selected" : ""}>Responses</option>
+            <option value="inputs" ${settings.autoMode === "inputs" ? "selected" : ""}>Inputs</option>
+            <option value="both" ${settings.autoMode === "both" ? "selected" : ""}>Both</option>
           </select>
         </label>
+        <label>Tracker connection id
+          <input data-setting="trackerConnectionId" value="${escapeHtml(settings.trackerConnectionId ?? "")}" placeholder="Use active connection">
+        </label>
+        <label>Tracker preset id
+          <input data-setting="trackerPresetId" value="${escapeHtml(settings.trackerPresetId ?? "")}" placeholder="Optional">
+        </label>
         <label>Recent messages
-          <input data-setting="includeLastMessages" type="number" min="1" max="200" value="${settings.includeLastMessages}">
+          <input data-setting="trackerContextMessageLimit" type="number" min="0" max="400" value="${settings.trackerContextMessageLimit}">
+        </label>
+        <label>Skip first messages
+          <input data-setting="skipFirstMessages" type="number" min="0" max="1000" value="${settings.skipFirstMessages}">
         </label>
         <label>Tracker context
           <input data-setting="includeLastTrackers" type="number" min="0" max="25" value="${settings.includeLastTrackers}">
@@ -543,21 +823,35 @@ function renderSettings(settings) {
           <input data-setting="maxResponseTokens" type="number" min="1" max="64000" value="${settings.maxResponseTokens}">
         </label>
         <label class="tracktor-check">
-          <input data-setting="sequentialPartGeneration" type="checkbox" ${settings.sequentialPartGeneration ? "checked" : ""}>
+          <input data-setting="sequentialGeneration" type="checkbox" ${settings.sequentialGeneration ? "checked" : ""}>
           Sequential part generation
         </label>
         <label class="tracktor-check">
-          <input data-setting="injection.enabled" type="checkbox" ${settings.injection.enabled ? "checked" : ""}>
+          <input data-setting="injectTrackerSnapshots" type="checkbox" ${settings.injectTrackerSnapshots ? "checked" : ""}>
           Inject snapshots into normal generations
         </label>
         <label>Injected snapshots
-          <input data-setting="injection.includeLastTrackers" type="number" min="0" max="25" value="${settings.injection.includeLastTrackers}">
+          <input data-setting="trackerSnapshotCount" type="number" min="0" max="25" value="${settings.trackerSnapshotCount}">
         </label>
         <label>Injection role
-          <select data-setting="injection.role">
-            <option value="system" ${settings.injection.role === "system" ? "selected" : ""}>System</option>
-            <option value="user" ${settings.injection.role === "user" ? "selected" : ""}>User</option>
-            <option value="assistant" ${settings.injection.role === "assistant" ? "selected" : ""}>Assistant</option>
+          <select data-setting="snapshotRole">
+            <option value="system" ${settings.snapshotRole === "system" ? "selected" : ""}>System</option>
+            <option value="user" ${settings.snapshotRole === "user" ? "selected" : ""}>User</option>
+            <option value="assistant" ${settings.snapshotRole === "assistant" ? "selected" : ""}>Assistant</option>
+          </select>
+        </label>
+        <label>Conversation roles
+          <select data-setting="trackerConversationRoleMode">
+            <option value="preserve" ${settings.trackerConversationRoleMode === "preserve" ? "selected" : ""}>Preserve</option>
+            <option value="all_assistant" ${settings.trackerConversationRoleMode === "all_assistant" ? "selected" : ""}>All assistant</option>
+            <option value="plain_transcript" ${settings.trackerConversationRoleMode === "plain_transcript" ? "selected" : ""}>Plain transcript</option>
+          </select>
+        </label>
+        <label>Snapshot transform
+          <select data-setting="snapshotTransformPresetKey">
+            <option value="default_json" ${settings.snapshotTransformPresetKey === "default_json" ? "selected" : ""}>Default JSON</option>
+            <option value="minimal" ${settings.snapshotTransformPresetKey === "minimal" ? "selected" : ""}>Minimal</option>
+            <option value="toon" ${settings.snapshotTransformPresetKey === "toon" ? "selected" : ""}>TOON</option>
           </select>
         </label>
         <label>Chat variable key
@@ -568,7 +862,7 @@ function renderSettings(settings) {
         <textarea data-setting="systemPrompt" rows="5">${escapeHtml(settings.systemPrompt)}</textarea>
       </label>
       <label>Extraction prompt
-        <textarea data-setting="extractionPrompt" rows="4">${escapeHtml(settings.extractionPrompt)}</textarea>
+        <textarea data-setting="trackerInstructionPrompt" rows="4">${escapeHtml(settings.trackerInstructionPrompt)}</textarea>
       </label>
       <div class="tracktor-actions">
         <button type="button" data-action="save-settings">Save Settings</button>
@@ -585,7 +879,7 @@ function renderSchemaEditor(settings) {
       <h2>Schema</h2>
       <div class="tracktor-form-grid">
         <label>Active preset
-          <select data-setting="activeSchemaId">
+          <select data-setting="activeSchemaPresetKey">
             ${presets.map((preset) => `<option value="${escapeHtml(preset.id)}" ${preset.id === active.id ? "selected" : ""}>${escapeHtml(preset.name)}</option>`).join("")}
           </select>
         </label>
@@ -612,16 +906,22 @@ function renderSchemaEditor(settings) {
 function handleClick(event) {
   const target = event.target;
   const button = target?.closest("[data-action]");
-  if (!button || !state) return;
+  if (!button) return;
   const action = button.dataset.action;
   if (action === "refresh") {
-    ctxRef.sendToBackend({ type: "get_state" });
+    sendBackend({ type: "refresh_state" });
+  } else if (action === "open-extension-settings") {
+    ctxRef.events?.emit?.("open-settings", { view: "extensions" });
+  } else if (!state) {
+    return;
   } else if (action === "generate-latest") {
-    ctxRef.sendToBackend({ type: "generate_tracker", chatId: state.activeChat?.id });
+    sendBackend({ type: "generate_tracker", chatId: state.activeChat?.id });
   } else if (action === "generate-latest-sequential") {
-    ctxRef.sendToBackend({ type: "generate_tracker", chatId: state.activeChat?.id, sequential: true });
+    sendBackend({ type: "generate_tracker", chatId: state.activeChat?.id, sequential: true });
   } else if (action === "regenerate") {
-    ctxRef.sendToBackend({ type: "generate_tracker", chatId: button.dataset.chatId, messageId: button.dataset.messageId });
+    sendBackend({ type: "regenerate_tracker", chatId: button.dataset.chatId, messageId: button.dataset.messageId });
+  } else if (action === "regenerate-part") {
+    sendBackend({ type: "regenerate_part", chatId: button.dataset.chatId, messageId: button.dataset.messageId, partKey: button.dataset.partKey });
   } else if (action === "edit") {
     openEditModal(button.dataset.chatId, button.dataset.messageId);
   } else if (action === "delete") {
@@ -633,10 +933,10 @@ function handleClick(event) {
   } else if (action === "save-schema") {
     saveSchemaFromDom(getRootForAction(button));
   } else if (action === "use-schema-for-chat") {
-    ctxRef.sendToBackend({
+    sendBackend({
       type: "set_chat_schema",
       chatId: state.activeChat?.id,
-      schemaId: state.settings.activeSchemaId
+      schemaId: state.settings.activeSchemaPresetKey
     });
   }
 }
@@ -676,6 +976,7 @@ function restoreDefaultPrompts() {
   if (!state) return;
   state.settings.systemPrompt = DEFAULT_SYSTEM_PROMPT;
   state.settings.extractionPrompt = DEFAULT_EXTRACTION_PROMPT;
+  state.settings.trackerInstructionPrompt = DEFAULT_EXTRACTION_PROMPT;
   ctxRef.sendToBackend({ type: "save_settings", settings: deepMergeSettings(state.settings) });
   render();
 }
@@ -692,10 +993,16 @@ function saveSchemaFromDom(sourceRoot) {
     const settings = structuredClone(state.settings);
     settings.schemaPresets[id] = {
       id,
+      key: id,
       name: nameInput.value.trim() || id,
       schema,
-      templateHtml: templateInput.value
+      jsonSchema: schema,
+      templateHtml: templateInput.value,
+      renderTemplate: templateInput.value,
+      createdAt: state.settings.schemaPresets[id]?.createdAt ?? Date.now(),
+      updatedAt: Date.now()
     };
+    settings.activeSchemaPresetKey = id;
     settings.activeSchemaId = id;
     ctxRef.sendToBackend({ type: "save_settings", settings });
   } catch (error) {
@@ -714,7 +1021,7 @@ function openEditModal(chatId, messageId) {
     if (next === null) return;
     try {
       JSON.parse(next);
-      ctxRef.sendToBackend({ type: "update_tracker", chatId, messageId, data: next });
+      sendBackend({ type: "edit_snapshot", chatId, messageId, data: next });
     } catch (error) {
       showErrorModal(error instanceof Error ? error.message : String(error));
     }
@@ -741,7 +1048,7 @@ function openEditModal(chatId, messageId) {
     if (!textarea) return;
     try {
       JSON.parse(textarea.value);
-      ctxRef.sendToBackend({ type: "update_tracker", chatId, messageId, data: textarea.value });
+      sendBackend({ type: "edit_snapshot", chatId, messageId, data: textarea.value });
       modal.dismiss();
     } catch (error) {
       showErrorModal(error instanceof Error ? error.message : String(error));
@@ -757,7 +1064,7 @@ async function confirmDelete(chatId, messageId) {
     confirmLabel: "Delete"
   }) : { confirmed: window.confirm("Delete tracker data from this message?") };
   if (confirmed) {
-    ctxRef.sendToBackend({ type: "delete_tracker", chatId, messageId });
+    sendBackend({ type: "delete_snapshot", chatId, messageId });
   }
 }
 function showErrorModal(message) {
@@ -769,7 +1076,12 @@ function showErrorModal(message) {
   modal.root.innerHTML = `<p class="tracktor-error-text">${escapeHtml(message)}</p>`;
 }
 function renderMessageWidgets() {
-  if (!ctxRef.messages || !state?.activeChat) return;
+  if (!ctxRef.messages) return;
+  if (!state?.activeChat) {
+    for (const cleanup of widgetCleanups.values()) cleanup();
+    widgetCleanups.clear();
+    return;
+  }
   const activeIds = new Set(state.activeChat.trackers.map((item) => item.messageId));
   for (const [messageId, cleanup] of widgetCleanups.entries()) {
     if (!activeIds.has(messageId)) {
@@ -791,7 +1103,7 @@ function renderMessageWidgets() {
       },
       (message) => {
         if (message?.type === "regenerate") {
-          ctxRef.sendToBackend({ type: "generate_tracker", chatId: tracker.chatId, messageId: tracker.messageId });
+          sendBackend({ type: "regenerate_tracker", chatId: tracker.chatId, messageId: tracker.messageId });
         } else if (message?.type === "edit") {
           openEditModal(tracker.chatId, tracker.messageId);
         } else if (message?.type === "delete") {
@@ -923,6 +1235,33 @@ var STYLES = `
     overflow: auto;
   }
   .tracktor-shell { display: flex; flex-direction: column; gap: 10px; padding: 10px; }
+  .tracktor-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 10px;
+    border-bottom: 1px solid var(--lumiverse-border);
+    padding-bottom: 10px;
+  }
+  .tracktor-header span {
+    display: block;
+    color: var(--lumiverse-text-muted);
+    font-size: 11px;
+    margin-top: 2px;
+  }
+  .tracktor-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    justify-content: flex-end;
+  }
+  .tracktor-tabs span {
+    border: 1px solid var(--lumiverse-border);
+    border-radius: 6px;
+    padding: 4px 6px;
+    color: var(--lumiverse-text);
+    background: var(--lumiverse-fill-subtle);
+  }
   .tracktor-section { border-top: 1px solid var(--lumiverse-border); padding-top: 10px; }
   .tracktor-section:first-child { border-top: 0; padding-top: 0; }
   .tracktor-section h2 { font-size: 13px; margin: 0 0 8px; font-weight: 650; }
@@ -947,6 +1286,8 @@ var STYLES = `
   .tracktor-item { border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill-subtle); border-radius: 8px; padding: 9px; }
   .tracktor-item-head { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
   .tracktor-rendered { font-size: 12px; }
+  .tracktor-parts { margin: 7px 0; }
+  .tracktor-parts summary { cursor: pointer; font-size: 12px; color: var(--lumiverse-text-muted); }
   .tracktor-rendered table { width: 100%; border-collapse: collapse; }
   .tracktor-rendered td { border-top: 1px solid var(--lumiverse-border); padding: 4px 6px; vertical-align: top; }
   .tracktor-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
@@ -964,6 +1305,14 @@ var STYLES = `
   .tracktor-warning { color: #d8a72d; }
   .tracktor-error, .tracktor-error-text { color: #e46c6c; }
   .tracktor-busy { color: var(--lumiverse-accent); }
+  .tracktor-diagnostics {
+    border: 1px solid var(--lumiverse-border);
+    background: var(--lumiverse-fill-subtle);
+    border-radius: 8px;
+    padding: 8px;
+    font-size: 12px;
+  }
+  .tracktor-diagnostics p { margin: 6px 0 0; color: var(--lumiverse-text-muted); }
   .tracktor-modal-body { display: flex; flex-direction: column; gap: 8px; }
   .tracktor-json-editor { min-height: 420px; width: 100%; box-sizing: border-box; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   @media (max-width: 680px) {

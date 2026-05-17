@@ -1,7 +1,9 @@
 declare const spindle: any;
 
 import {
+  DIAGNOSTICS_PATH,
   METADATA_KEY,
+  SCHEMA_PRESETS_PATH,
   SETTINGS_PATH,
   VERSION,
   type ActiveChatState,
@@ -11,47 +13,87 @@ import {
   type LlmMessageDTO,
   type MessageRole,
   type SchemaPreset,
+  type TrackerJobState,
+  type TrackerMetadataMirror,
   type TrackerRecord,
+  type TrackerSnapshot,
+  type TrackerSnapshotFile,
   type TrackerSummary,
   type TracktorSettings,
   buildTopLevelPartSchema,
   chatConfigPath,
-  defaultSettings,
   deepMergeSettings,
+  defaultSchemaPresets,
+  defaultSettings,
   formatTrackerSnapshot,
   getSchemaPreset,
   getTopLevelSchemaKeys,
+  isPlainObject,
+  jobsPath,
   renderTrackerTemplate,
   safePreview,
+  safeRenderTracker,
+  sanitizeSchemaPresetMap,
   schemaToExample,
+  settingsForStorage,
+  snapshotToRecord,
+  snapshotsPath,
 } from './shared.js';
 import { parseJsonTrackerResponse } from './parser.js';
 
-let settingsCache: TracktorSettings | undefined;
-let busy = false;
-let lastError: string | undefined;
+type FrontendMessage = Record<string, any>;
+
+interface BackendJob {
+  state: TrackerJobState;
+  userId: string;
+  controller: AbortController;
+}
+
+const settingsCache = new Map<string, TracktorSettings>();
+const activeJobs = new Map<string, BackendJob>();
+const lastErrors = new Map<string, string>();
+const diagnostics = new Map<string, string[]>();
+const chatUserIds = new Map<string, string>();
+let lastFrontendUserId: string | null = null;
 let interceptorRegistered = false;
 
-async function loadSettings(): Promise<TracktorSettings> {
-  if (settingsCache) return settingsCache;
-  const saved = await spindle.storage.getJson(SETTINGS_PATH, { fallback: defaultSettings });
-  settingsCache = deepMergeSettings(saved);
-  await spindle.storage.setJson(SETTINGS_PATH, settingsCache, { indent: 2 });
-  return settingsCache;
+function setUserFromFrontend(userId: string | undefined, chatId?: string | null): void {
+  if (userId) lastFrontendUserId = userId;
+  if (userId && chatId) chatUserIds.set(chatId, userId);
 }
 
-async function saveSettings(settings: TracktorSettings): Promise<TracktorSettings> {
-  settingsCache = deepMergeSettings(settings);
-  await spindle.storage.setJson(SETTINGS_PATH, settingsCache, { indent: 2 });
-  return settingsCache;
+function resolveUserId(chatId?: string | null, explicitUserId?: string | null): string | null {
+  if (explicitUserId) return explicitUserId;
+  if (chatId) {
+    const mapped = chatUserIds.get(chatId);
+    if (mapped) return mapped;
+  }
+  return lastFrontendUserId;
 }
 
-async function loadChatConfig(chatId: string): Promise<ChatTracktorConfig> {
-  return spindle.storage.getJson(chatConfigPath(chatId), { fallback: {} });
+function requireUserId(userId?: string | null): string {
+  if (!userId) {
+    throw new Error('Tracktor could not resolve the Lumiverse userId. Open the Tracktor drawer once, then retry.');
+  }
+  return userId;
 }
 
-async function saveChatConfig(chatId: string, config: ChatTracktorConfig): Promise<void> {
-  await spindle.storage.setJson(chatConfigPath(chatId), config, { indent: 2 });
+function send(userId: string | null | undefined, payload: unknown): void {
+  if (!userId) {
+    spindle.log.warn(`Tracktor skipped frontend send without userId: ${JSON.stringify(payload).slice(0, 220)}`);
+    return;
+  }
+  spindle.sendToFrontend(payload, userId);
+}
+
+async function addDiagnostic(userId: string | null | undefined, message: string): Promise<void> {
+  const target = userId ?? lastFrontendUserId;
+  spindle.log.warn(message);
+  if (!target) return;
+  const list = [message, ...(diagnostics.get(target) ?? [])].slice(0, 12);
+  diagnostics.set(target, list);
+  await spindle.userStorage.setJson(DIAGNOSTICS_PATH, { messages: list, updatedAt: Date.now() }, { indent: 2, userId: target }).catch(() => {});
+  send(target, { type: 'diagnostic', message });
 }
 
 function hasPermission(permission: string): boolean {
@@ -70,63 +112,172 @@ function permissionWarnings(): string[] {
   return warnings;
 }
 
-async function buildState(): Promise<FrontendState> {
-  const settings = await loadSettings();
+async function loadSettings(userId: string): Promise<TracktorSettings> {
+  const cached = settingsCache.get(userId);
+  if (cached) return cached;
+
+  const [savedSettings, savedSchemas, savedDiagnostics] = await Promise.all([
+    spindle.userStorage.getJson(SETTINGS_PATH, { fallback: defaultSettings, userId }).catch(() => defaultSettings),
+    spindle.userStorage.getJson(SCHEMA_PRESETS_PATH, { fallback: null, userId }).catch(() => null),
+    spindle.userStorage.getJson(DIAGNOSTICS_PATH, { fallback: { messages: [] }, userId }).catch(() => ({ messages: [] })),
+  ]);
+  const schemaPresets = sanitizeSchemaPresetMap(savedSchemas ?? (isPlainObject(savedSettings) ? savedSettings.schemaPresets : null));
+  const settings = deepMergeSettings(savedSettings, schemaPresets);
+  settingsCache.set(userId, settings);
+  if (Array.isArray(savedDiagnostics?.messages)) {
+    diagnostics.set(userId, savedDiagnostics.messages.filter((item: unknown) => typeof item === 'string').slice(0, 12));
+  }
+  await saveSettings(settings, userId);
+  return settings;
+}
+
+async function saveSettings(settings: TracktorSettings, userId: string): Promise<TracktorSettings> {
+  const merged = deepMergeSettings(settings, settings.schemaPresets);
+  settingsCache.set(userId, merged);
+  await Promise.all([
+    spindle.userStorage.setJson(SETTINGS_PATH, settingsForStorage(merged), { indent: 2, userId }),
+    spindle.userStorage.setJson(SCHEMA_PRESETS_PATH, merged.schemaPresets, { indent: 2, userId }),
+  ]);
+  return merged;
+}
+
+async function loadChatConfig(userId: string, chatId: string): Promise<ChatTracktorConfig> {
+  return spindle.userStorage.getJson(chatConfigPath(chatId), { fallback: {}, userId });
+}
+
+async function saveChatConfig(userId: string, chatId: string, config: ChatTracktorConfig): Promise<void> {
+  await spindle.userStorage.setJson(chatConfigPath(chatId), config, { indent: 2, userId });
+}
+
+async function loadSnapshots(userId: string, chatId: string): Promise<TrackerSnapshot[]> {
+  const file = await spindle.userStorage.getJson(snapshotsPath(chatId), {
+    fallback: { chatId, snapshots: [] } satisfies TrackerSnapshotFile,
+    userId,
+  }).catch(() => ({ chatId, snapshots: [] } satisfies TrackerSnapshotFile));
+  const snapshots = Array.isArray(file?.snapshots) ? file.snapshots : [];
+  return snapshots.flatMap((snapshot: unknown) => normalizeSnapshot(snapshot, chatId));
+}
+
+async function saveSnapshots(userId: string, chatId: string, snapshots: TrackerSnapshot[]): Promise<void> {
+  snapshots.sort((a, b) => a.updatedAt - b.updatedAt);
+  await spindle.userStorage.setJson(snapshotsPath(chatId), { chatId, snapshots }, { indent: 2, userId });
+}
+
+function normalizeSnapshot(input: unknown, fallbackChatId: string): TrackerSnapshot[] {
+  if (!isPlainObject(input)) return [];
+  if (!isPlainObject(input.value) || typeof input.messageId !== 'string') return [];
+  const now = Date.now();
+  return [{
+    id: typeof input.id === 'string' ? input.id : makeId('snapshot'),
+    chatId: typeof input.chatId === 'string' ? input.chatId : fallbackChatId,
+    messageId: input.messageId,
+    schemaPresetKey: typeof input.schemaPresetKey === 'string' ? input.schemaPresetKey : typeof input.schemaId === 'string' ? input.schemaId : 'scene',
+    value: input.value as Record<string, unknown>,
+    renderTemplate: typeof input.renderTemplate === 'string' ? input.renderTemplate : typeof input.templateHtml === 'string' ? input.templateHtml : '',
+    partsOrder: Array.isArray(input.partsOrder) ? input.partsOrder.filter((part): part is string => typeof part === 'string') : [],
+    partsMeta: isPlainObject(input.partsMeta) ? input.partsMeta : {},
+    pendingRedactions: isPlainObject(input.pendingRedactions) ? input.pendingRedactions : {},
+    createdAt: typeof input.createdAt === 'number' ? input.createdAt : now,
+    updatedAt: typeof input.updatedAt === 'number' ? input.updatedAt : now,
+  }];
+}
+
+async function upsertSnapshot(userId: string, snapshot: TrackerSnapshot): Promise<void> {
+  const snapshots = await loadSnapshots(userId, snapshot.chatId);
+  const index = snapshots.findIndex((item) => item.messageId === snapshot.messageId);
+  if (index >= 0) snapshots[index] = snapshot;
+  else snapshots.push(snapshot);
+  await saveSnapshots(userId, snapshot.chatId, snapshots);
+}
+
+async function deleteSnapshot(userId: string, chatId: string, messageId: string): Promise<void> {
+  const snapshots = await loadSnapshots(userId, chatId);
+  await saveSnapshots(userId, chatId, snapshots.filter((item) => item.messageId !== messageId));
+}
+
+async function buildState(userId: string, chatId?: string | null): Promise<FrontendState> {
+  const settings = await loadSettings(userId);
+  const userJobs = [...activeJobs.values()].filter((job) => job.userId === userId).map((job) => job.state);
   return {
     settings,
-    activeChat: await getActiveChatState(settings),
+    activeChat: await getActiveChatState(settings, userId, chatId),
     permissionWarnings: permissionWarnings(),
-    busy,
-    ...(lastError ? { lastError } : {}),
+    busy: userJobs.length > 0,
+    jobs: userJobs,
+    diagnostics: diagnostics.get(userId) ?? [],
+    ...(lastErrors.get(userId) ? { lastError: lastErrors.get(userId) } : {}),
   };
 }
 
-async function sendState(userId?: string): Promise<void> {
-  spindle.sendToFrontend({ type: 'state', state: await buildState() }, userId);
+async function sendState(userId: string, chatId?: string | null): Promise<void> {
+  send(userId, { type: 'state', state: await buildState(userId, chatId) });
 }
 
-async function getActiveChatState(settings: TracktorSettings): Promise<ActiveChatState | null> {
-  if (!hasPermission('chats') || !hasPermission('chat_mutation')) {
-    return null;
-  }
-
-  const chat = await spindle.chats.getActive();
-  if (!chat) return null;
-  const messages = await spindle.chat.getMessages(chat.id) as ChatMessageDTO[];
+async function getActiveChatState(settings: TracktorSettings, userId: string, chatId?: string | null): Promise<ActiveChatState | null> {
+  if (!hasPermission('chats') || !hasPermission('chat_mutation')) return null;
+  const chat = chatId
+    ? await spindle.chats.get(chatId, userId).catch(() => null)
+    : await spindle.chats.getActive(userId).catch(() => null);
+  if (!chat?.id) return null;
+  chatUserIds.set(chat.id, userId);
+  const messages = await spindle.chat.getMessages(chat.id, userId) as ChatMessageDTO[];
+  const snapshots = await loadSnapshots(userId, chat.id);
   return {
     id: chat.id,
     name: chat.name ?? 'Active chat',
     messageCount: messages.length,
-    trackers: collectTrackerSummaries(chat.id, messages, settings),
+    trackers: collectTrackerSummaries(chat.id, messages, snapshots, settings),
   };
 }
 
-function collectTrackerSummaries(chatId: string, messages: ChatMessageDTO[], settings: TracktorSettings): TrackerSummary[] {
+function collectTrackerSummaries(
+  chatId: string,
+  messages: ChatMessageDTO[],
+  snapshots: TrackerSnapshot[],
+  settings: TracktorSettings,
+): TrackerSummary[] {
+  const byMessage = new Map(snapshots.map((snapshot) => [snapshot.messageId, snapshot]));
   return messages.flatMap((message) => {
-    const tracker = readTrackerRecord(message);
-    if (!tracker) return [];
-    const preset = settings.schemaPresets[tracker.schemaId];
-    const renderedHtml = safeRenderTracker(tracker.templateHtml || preset?.templateHtml || '', tracker.data);
+    const snapshot = byMessage.get(message.id) ?? legacySnapshotFromMessage(chatId, message);
+    if (!snapshot) return [];
+    const preset = settings.schemaPresets[snapshot.schemaPresetKey];
     return [{
       chatId,
       messageId: message.id,
       role: message.role,
       messagePreview: safePreview(message.content || ''),
-      tracker: {
-        ...tracker,
-        renderedHtml,
-      },
+      snapshot,
+      tracker: snapshotToRecord(snapshot, preset),
     }];
   });
 }
 
-function readTrackerRecord(message: ChatMessageDTO): TrackerRecord | undefined {
-  const metadata = message.metadata;
-  const candidate = metadata?.[METADATA_KEY];
-  if (!candidate || typeof candidate !== 'object') return undefined;
-  const record = candidate as TrackerRecord;
-  if (!record.data || !record.sourceMessageId) return undefined;
-  return record;
+function legacySnapshotFromMessage(chatId: string, message: ChatMessageDTO): TrackerSnapshot | undefined {
+  const candidate = message.metadata?.[METADATA_KEY];
+  if (!isPlainObject(candidate) || !('data' in candidate) || !candidate.data || !candidate.sourceMessageId) return undefined;
+  const record = candidate as unknown as TrackerRecord;
+  if (!isPlainObject(record.data)) return undefined;
+  const updatedAt = Date.parse(record.updatedAt || '') || Date.now();
+  return {
+    id: record.snapshotId ?? makeSnapshotId(chatId, message.id),
+    chatId,
+    messageId: message.id,
+    schemaPresetKey: record.schemaId,
+    value: record.data as Record<string, unknown>,
+    renderTemplate: record.templateHtml,
+    partsOrder: getTopLevelSchemaKeys(record.schema),
+    partsMeta: {},
+    pendingRedactions: record.pendingRedactions ?? {},
+    createdAt: updatedAt,
+    updatedAt,
+  };
+}
+
+function readSnapshotMirror(message: ChatMessageDTO): TrackerMetadataMirror | undefined {
+  const candidate = message.metadata?.[METADATA_KEY];
+  if (!isPlainObject(candidate)) return undefined;
+  if (typeof candidate.snapshotId !== 'string' || typeof candidate.updatedAt !== 'number') return undefined;
+  return candidate as unknown as TrackerMetadataMirror;
 }
 
 function resolveTargetMessage(messages: ChatMessageDTO[], requestedMessageId?: string): ChatMessageDTO {
@@ -135,40 +286,50 @@ function resolveTargetMessage(messages: ChatMessageDTO[], requestedMessageId?: s
     if (!found) throw new Error(`Message not found: ${requestedMessageId}`);
     return found;
   }
-
-  const preferred = [...messages].reverse().find((message) => message.role === 'assistant') ?? messages[messages.length - 1];
-  if (!preferred) throw new Error('No messages are available in the active chat.');
-  return preferred;
+  const latest = messages[messages.length - 1];
+  if (!latest) throw new Error('No messages are available in the active chat.');
+  return latest;
 }
 
 async function generateTrackerForMessage(options: {
+  userId: string;
   chatId?: string;
   messageId?: string;
   sequential?: boolean;
-  userId?: string;
-}): Promise<TrackerRecord> {
+  job?: BackendJob;
+}): Promise<TrackerSnapshot> {
   if (!hasPermission('generation')) throw new Error('Generation permission is not granted.');
+  if (!hasPermission('chats')) throw new Error('Chats permission is not granted.');
   if (!hasPermission('chat_mutation')) throw new Error('Chat mutation permission is not granted.');
 
-  const settings = await loadSettings();
+  const settings = await loadSettings(options.userId);
   const chat = options.chatId
-    ? { id: options.chatId }
-    : await spindle.chats.getActive();
+    ? await spindle.chats.get(options.chatId, options.userId).catch(() => ({ id: options.chatId }))
+    : await spindle.chats.getActive(options.userId);
   if (!chat?.id) throw new Error('No active chat is open.');
+  chatUserIds.set(chat.id, options.userId);
 
-  const messages = await spindle.chat.getMessages(chat.id) as ChatMessageDTO[];
+  const messages = await spindle.chat.getMessages(chat.id, options.userId) as ChatMessageDTO[];
   const target = resolveTargetMessage(messages, options.messageId);
   const targetIndex = messages.findIndex((message) => message.id === target.id);
-  const chatConfig = await loadChatConfig(chat.id);
-  const preset = getSchemaPreset(settings, chatConfig.schemaId);
-  const sequential = options.sequential ?? settings.sequentialPartGeneration;
-  const data = sequential
-    ? await generateTrackerSequential(messages, targetIndex, settings, preset, options.userId)
-    : await generateTrackerFull(messages, targetIndex, settings, preset, options.userId);
+  if (settings.skipFirstMessages > 0 && targetIndex < settings.skipFirstMessages) {
+    throw new Error(`Tracker generation is skipped for the first ${settings.skipFirstMessages} messages.`);
+  }
 
-  const record = makeTrackerRecord(target.id, preset, data);
-  await persistTrackerRecord(chat.id, target, record, settings);
-  return record;
+  const chatConfig = await loadChatConfig(options.userId, chat.id);
+  const preset = getSchemaPreset(settings, chatConfig.schemaPresetKey ?? chatConfig.schemaId);
+  const snapshots = await loadSnapshots(options.userId, chat.id);
+  const priorSnapshots = collectPriorSnapshots(messages, snapshots, targetIndex, settings.includeLastTrackers);
+  const sequential = options.sequential ?? settings.sequentialGeneration;
+  const data = sequential
+    ? await generateTrackerSequential(messages, targetIndex, settings, preset, priorSnapshots, options.userId, options.job)
+    : await generateTrackerFull(messages, targetIndex, settings, preset, priorSnapshots, options.userId, options.job?.controller.signal);
+
+  assertSchemaRequired(data, preset.schema);
+  const snapshot = makeTrackerSnapshot(chat.id, target.id, preset, data, snapshots.find((item) => item.messageId === target.id));
+  renderTrackerTemplate(snapshot.renderTemplate, snapshot.value);
+  await persistTrackerSnapshot(options.userId, target, snapshot, settings);
+  return snapshot;
 }
 
 async function generateTrackerFull(
@@ -176,10 +337,14 @@ async function generateTrackerFull(
   targetIndex: number,
   settings: TracktorSettings,
   preset: SchemaPreset,
-  userId?: string,
-): Promise<unknown> {
-  const prompt = buildTrackerPrompt(messages, targetIndex, settings, preset);
-  return requestJsonForSchema(prompt, preset.schema, 'tracktor_tracker', settings, userId);
+  priorSnapshots: TrackerSnapshot[],
+  userId: string,
+  signal?: AbortSignal,
+): Promise<Record<string, unknown>> {
+  const prompt = buildTrackerPrompt(messages, targetIndex, settings, preset, priorSnapshots);
+  const data = await requestJsonForSchema(prompt, preset.schema, 'tracktor_tracker', settings, userId, signal);
+  if (!isPlainObject(data)) throw new Error('Tracker response was not a JSON object.');
+  return data;
 }
 
 async function generateTrackerSequential(
@@ -187,19 +352,24 @@ async function generateTrackerSequential(
   targetIndex: number,
   settings: TracktorSettings,
   preset: SchemaPreset,
-  userId?: string,
+  priorSnapshots: TrackerSnapshot[],
+  userId: string,
+  job?: BackendJob,
 ): Promise<Record<string, unknown>> {
   const keys = getTopLevelSchemaKeys(preset.schema);
   if (keys.length === 0) throw new Error('The active tracker schema has no top-level properties.');
 
   const tracker: Record<string, unknown> = {};
-  for (const key of keys) {
+  for (let index = 0; index < keys.length; index += 1) {
+    if (job?.controller.signal.aborted) throw new DOMException('Tracker generation cancelled.', 'AbortError');
+    const key = keys[index];
+    updateJob(job, { currentPart: index + 1, totalParts: keys.length, label: `Generating ${key}` });
     const partSchema = buildTopLevelPartSchema(preset.schema, key);
-    const prompt = buildTrackerPrompt(messages, targetIndex, settings, preset, {
+    const prompt = buildTrackerPrompt(messages, targetIndex, settings, preset, priorSnapshots, {
       partKey: key,
       trackerSoFar: tracker,
     });
-    const part = await requestJsonForSchema(prompt, partSchema, `tracktor_${key}`, settings, userId);
+    const part = await requestJsonForSchema(prompt, partSchema, `tracktor_${key}`, settings, userId, job?.controller.signal);
     if (!part || typeof part !== 'object' || !(key in (part as Record<string, unknown>))) {
       throw new Error(`Part response did not include "${key}".`);
     }
@@ -213,14 +383,15 @@ async function requestJsonForSchema(
   schema: Record<string, unknown>,
   schemaName: string,
   settings: TracktorSettings,
-  userId?: string,
+  userId: string,
+  signal?: AbortSignal,
 ): Promise<unknown> {
   const parameters: Record<string, unknown> = {
     max_tokens: settings.maxResponseTokens,
   };
 
   const messages = [...promptMessages];
-  if (settings.generationMode === 'native_json') {
+  if (settings.structuredOutputMode === 'native_json_schema') {
     parameters.response_format = {
       type: 'json_schema',
       json_schema: {
@@ -232,7 +403,7 @@ async function requestJsonForSchema(
   } else {
     messages.push({
       role: 'user',
-      content: buildJsonFormatInstruction(schema),
+      content: buildFormatInstruction(settings, schema),
     });
   }
 
@@ -240,13 +411,12 @@ async function requestJsonForSchema(
     type: 'quiet',
     messages,
     parameters,
-    ...(userId ? { userId } : {}),
+    ...(settings.trackerConnectionId ? { connection_id: settings.trackerConnectionId } : {}),
+    userId,
+    signal,
   });
 
-  if (result?.content && typeof result.content === 'object') {
-    return result.content;
-  }
-
+  if (result?.content && typeof result.content === 'object') return result.content;
   const content = typeof result?.content === 'string' ? result.content : JSON.stringify(result?.content ?? '');
   const parsed = parseJsonTrackerResponse(content);
   if (settings.debugLogging && parsed.repairSteps.length > 0) {
@@ -260,11 +430,12 @@ function buildTrackerPrompt(
   targetIndex: number,
   settings: TracktorSettings,
   preset: SchemaPreset,
+  priorSnapshots: TrackerSnapshot[],
   options: { partKey?: string; trackerSoFar?: Record<string, unknown> } = {},
 ): LlmMessageDTO[] {
-  const start = Math.max(0, targetIndex - settings.includeLastMessages + 1);
+  const limit = settings.trackerContextMessageLimit;
+  const start = limit <= 0 ? 0 : Math.max(0, targetIndex - limit + 1);
   const recent = messages.slice(start, targetIndex + 1);
-  const priorTrackers = collectPriorTrackers(messages.slice(0, targetIndex + 1), settings.includeLastTrackers);
   const target = messages[targetIndex];
   const partLine = options.partKey
     ? `Generate only the top-level "${options.partKey}" property and return it wrapped in a JSON object.`
@@ -275,7 +446,7 @@ function buildTrackerPrompt(
     {
       role: 'user',
       content: [
-        settings.extractionPrompt,
+        settings.trackerInstructionPrompt,
         partLine,
         `Active schema preset: ${preset.name}`,
         `Target message id: ${target.id}`,
@@ -283,10 +454,10 @@ function buildTrackerPrompt(
     },
   ];
 
-  if (priorTrackers.length > 0) {
+  if (priorSnapshots.length > 0) {
     prompt.push({
       role: 'user',
-      content: `Previous tracker snapshots for continuity:\n\n${priorTrackers.map((record) => formatTrackerSnapshot(record, record.schemaName)).join('\n\n')}`,
+      content: `Previous tracker snapshots for continuity:\n\n${priorSnapshots.map((snapshot) => formatTrackerSnapshot(snapshot, snapshot.schemaPresetKey)).join('\n\n')}`,
     });
   }
 
@@ -299,124 +470,215 @@ function buildTrackerPrompt(
 
   prompt.push({
     role: 'user',
-    content: `Recent conversation up to the target message:\n\n${formatConversation(recent)}`,
+    content: `Recent conversation up to the target message:\n\n${formatConversation(recent, settings)}`,
   });
 
   return prompt;
 }
 
-function buildJsonFormatInstruction(schema: Record<string, unknown>): string {
-  return [
-    'Return only one valid JSON object. Do not include markdown fences, commentary, or prose outside JSON.',
-    'The object must conform to this JSON Schema:',
-    '```json',
-    JSON.stringify(schema, null, 2),
-    '```',
-    'Example shape:',
-    '```json',
-    JSON.stringify(schemaToExample(schema), null, 2),
-    '```',
-  ].join('\n');
+function buildFormatInstruction(settings: TracktorSettings, schema: Record<string, unknown>): string {
+  const template = settings.structuredOutputMode === 'xml_prompt'
+    ? settings.xmlPromptTemplate
+    : settings.structuredOutputMode === 'toon_prompt'
+      ? settings.toonPromptTemplate
+      : settings.jsonPromptTemplate;
+  return template
+    .replaceAll('{{schema}}', JSON.stringify(schema, null, 2))
+    .replaceAll('{{example_response}}', JSON.stringify(schemaToExample(schema), null, 2))
+    .replaceAll('{{format_instructions}}', 'Return only valid JSON that matches the schema.')
+    .replaceAll('{{current_tracker}}', '')
+    .replaceAll('{{target_part}}', '');
 }
 
-function formatConversation(messages: ChatMessageDTO[]): string {
+function formatConversation(messages: ChatMessageDTO[], settings: TracktorSettings): string {
+  if (settings.trackerConversationRoleMode === 'plain_transcript') {
+    return messages.map((message) => `${message.name || message.role}: ${message.content.trim()}`).join('\n\n');
+  }
   return messages
-    .map((message) => `${message.role.toUpperCase()} (${message.id}):\n${message.content.trim()}`)
+    .map((message) => {
+      const role = settings.trackerConversationRoleMode === 'all_assistant' ? 'assistant' : message.role;
+      return `${role.toUpperCase()} (${message.id}):\n${message.content.trim()}`;
+    })
     .join('\n\n');
 }
 
-function collectPriorTrackers(messages: ChatMessageDTO[], limit: number): TrackerRecord[] {
+function collectPriorSnapshots(messages: ChatMessageDTO[], snapshots: TrackerSnapshot[], targetIndex: number, limit: number): TrackerSnapshot[] {
   if (limit <= 0) return [];
-  const found: TrackerRecord[] = [];
-  for (let i = messages.length - 1; i >= 0 && found.length < limit; i -= 1) {
-    const record = readTrackerRecord(messages[i]);
-    if (record) found.unshift(record);
-  }
-  return found;
+  const messageIndex = new Map(messages.map((message, index) => [message.id, index]));
+  return snapshots
+    .filter((snapshot) => {
+      const index = messageIndex.get(snapshot.messageId);
+      return typeof index === 'number' && index <= targetIndex;
+    })
+    .sort((a, b) => (messageIndex.get(a.messageId) ?? 0) - (messageIndex.get(b.messageId) ?? 0))
+    .slice(-limit);
 }
 
-function makeTrackerRecord(messageId: string, preset: SchemaPreset, data: unknown): TrackerRecord {
+function makeTrackerSnapshot(
+  chatId: string,
+  messageId: string,
+  preset: SchemaPreset,
+  data: Record<string, unknown>,
+  existing?: TrackerSnapshot,
+): TrackerSnapshot {
+  const now = Date.now();
   return {
-    version: VERSION,
-    schemaId: preset.id,
-    schemaName: preset.name,
-    schema: preset.schema,
-    templateHtml: preset.templateHtml,
-    data,
-    renderedHtml: safeRenderTracker(preset.templateHtml, data),
-    updatedAt: new Date().toISOString(),
-    sourceMessageId: messageId,
+    id: existing?.id ?? makeSnapshotId(chatId, messageId),
+    chatId,
+    messageId,
+    schemaPresetKey: preset.key,
+    value: data,
+    renderTemplate: preset.renderTemplate,
+    partsOrder: getTopLevelSchemaKeys(preset.schema),
+    partsMeta: existing?.partsMeta ?? {},
+    pendingRedactions: existing?.pendingRedactions ?? {},
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now,
   };
 }
 
-function safeRenderTracker(templateHtml: string, data: unknown): string {
-  try {
-    return renderTrackerTemplate(templateHtml, data);
-  } catch (error) {
-    return `<pre>${escapeForPre(JSON.stringify(data, null, 2))}</pre>`;
-  }
-}
-
-function escapeForPre(value: string): string {
-  return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
-}
-
-async function persistTrackerRecord(
-  chatId: string,
+async function persistTrackerSnapshot(
+  userId: string,
   message: ChatMessageDTO,
-  record: TrackerRecord,
+  snapshot: TrackerSnapshot,
   settings: TracktorSettings,
 ): Promise<void> {
-  const nextMetadata = {
-    ...(message.metadata ?? {}),
-    [METADATA_KEY]: record,
-  };
-  await spindle.chat.updateMessage(chatId, message.id, { metadata: nextMetadata });
-
+  await upsertSnapshot(userId, snapshot);
+  if (hasPermission('chat_mutation')) {
+    const nextMetadata = {
+      ...(message.metadata ?? {}),
+      [METADATA_KEY]: { snapshotId: snapshot.id, updatedAt: snapshot.updatedAt } satisfies TrackerMetadataMirror,
+    };
+    await spindle.chat.updateMessage(snapshot.chatId, message.id, { metadata: nextMetadata }, userId).catch((error: unknown) => {
+      void addDiagnostic(userId, `Tracktor could not mirror snapshot metadata: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
   if (settings.chatVariableExport.enabled) {
-    await spindle.variables.chat.set(chatId, settings.chatVariableExport.key, JSON.stringify(record.data));
+    await spindle.variables?.chat?.set?.(snapshot.chatId, settings.chatVariableExport.key, JSON.stringify(snapshot.value)).catch?.(() => {});
   }
 }
 
-async function updateTrackerData(chatId: string, messageId: string, data: unknown): Promise<void> {
-  const settings = await loadSettings();
-  const messages = await spindle.chat.getMessages(chatId) as ChatMessageDTO[];
+async function updateTrackerData(userId: string, chatId: string, messageId: string, data: unknown): Promise<void> {
+  if (!isPlainObject(data)) throw new Error('Tracker JSON must be an object.');
+  const settings = await loadSettings(userId);
+  const messages = await spindle.chat.getMessages(chatId, userId) as ChatMessageDTO[];
   const message = messages.find((item) => item.id === messageId);
   if (!message) throw new Error(`Message not found: ${messageId}`);
-
-  const current = readTrackerRecord(message);
-  const preset = getSchemaPreset(settings, current?.schemaId);
-  const record = makeTrackerRecord(messageId, current ? {
-    id: current.schemaId,
-    name: current.schemaName,
-    schema: current.schema,
-    templateHtml: current.templateHtml,
-  } : preset, data);
-  await persistTrackerRecord(chatId, message, record, settings);
+  const snapshots = await loadSnapshots(userId, chatId);
+  const current = snapshots.find((item) => item.messageId === messageId) ?? legacySnapshotFromMessage(chatId, message);
+  const preset = getSchemaPreset(settings, current?.schemaPresetKey);
+  const snapshot = makeTrackerSnapshot(chatId, messageId, preset, data, current);
+  renderTrackerTemplate(snapshot.renderTemplate, snapshot.value);
+  await persistTrackerSnapshot(userId, message, snapshot, settings);
 }
 
-async function deleteTracker(chatId: string, messageId: string): Promise<void> {
-  const messages = await spindle.chat.getMessages(chatId) as ChatMessageDTO[];
+async function deleteTracker(userId: string, chatId: string, messageId: string): Promise<void> {
+  const messages = await spindle.chat.getMessages(chatId, userId) as ChatMessageDTO[];
   const message = messages.find((item) => item.id === messageId);
-  if (!message) throw new Error(`Message not found: ${messageId}`);
-  const nextMetadata = { ...(message.metadata ?? {}) };
-  delete nextMetadata[METADATA_KEY];
-  await spindle.chat.updateMessage(chatId, messageId, { metadata: nextMetadata });
-}
-
-async function setBusy<T>(work: () => Promise<T>, userId?: string): Promise<T> {
-  busy = true;
-  lastError = undefined;
-  await sendState(userId);
-  try {
-    return await work();
-  } catch (error) {
-    lastError = error instanceof Error ? error.message : String(error);
-    throw error;
-  } finally {
-    busy = false;
-    await sendState(userId);
+  await deleteSnapshot(userId, chatId, messageId);
+  if (message && hasPermission('chat_mutation')) {
+    const nextMetadata = { ...(message.metadata ?? {}) };
+    delete nextMetadata[METADATA_KEY];
+    await spindle.chat.updateMessage(chatId, messageId, { metadata: nextMetadata }, userId);
   }
+}
+
+async function regeneratePart(userId: string, chatId: string, messageId: string, partKey: string): Promise<void> {
+  const { settings, messages, targetIndex, preset, snapshot, message } = await loadSnapshotGenerationContext(userId, chatId, messageId);
+  const schema = buildTopLevelPartSchema(preset.schema, partKey);
+  const prompt = buildTrackerPrompt(messages, targetIndex, settings, preset, [], {
+    partKey,
+    trackerSoFar: omitKey(snapshot.value, partKey),
+  });
+  const part = await requestJsonForSchema(prompt, schema, `tracktor_${partKey}`, settings, userId);
+  if (!isPlainObject(part) || !(partKey in part)) throw new Error(`Part response did not include "${partKey}".`);
+  const next = { ...snapshot.value, [partKey]: part[partKey] };
+  const updated = makeTrackerSnapshot(chatId, messageId, preset, next, snapshot);
+  await persistTrackerSnapshot(userId, message, updated, settings);
+}
+
+async function loadSnapshotGenerationContext(userId: string, chatId: string, messageId: string) {
+  const settings = await loadSettings(userId);
+  const messages = await spindle.chat.getMessages(chatId, userId) as ChatMessageDTO[];
+  const message = messages.find((item) => item.id === messageId);
+  if (!message) throw new Error(`Message not found: ${messageId}`);
+  const snapshots = await loadSnapshots(userId, chatId);
+  const snapshot = snapshots.find((item) => item.messageId === messageId) ?? legacySnapshotFromMessage(chatId, message);
+  if (!snapshot) throw new Error('No tracker snapshot is saved for this message.');
+  const preset = getSchemaPreset(settings, snapshot.schemaPresetKey);
+  const targetIndex = messages.findIndex((item) => item.id === messageId);
+  return { settings, messages, message, snapshot, preset, targetIndex };
+}
+
+function omitKey(value: Record<string, unknown>, key: string): Record<string, unknown> {
+  const next = { ...value };
+  delete next[key];
+  return next;
+}
+
+function assertSchemaRequired(data: unknown, schema: Record<string, unknown>): void {
+  if (!isPlainObject(data)) throw new Error('Tracker response was not a JSON object.');
+  const required = Array.isArray(schema.required) ? schema.required : [];
+  const missing = required.filter((key): key is string => typeof key === 'string' && !(key in data));
+  if (missing.length > 0) throw new Error(`Tracker response is missing required fields: ${missing.join(', ')}`);
+}
+
+function makeId(prefix: string): string {
+  const random = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  return `${prefix}_${random}`;
+}
+
+function makeSnapshotId(chatId: string, messageId: string): string {
+  return `snap_${hashText(`${chatId}:${messageId}`)}`;
+}
+
+function hashText(value: string): string {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function createJob(userId: string, chatId: string, messageId: string | undefined, label: string): BackendJob {
+  const job: BackendJob = {
+    userId,
+    controller: new AbortController(),
+    state: {
+      id: makeId('job'),
+      chatId,
+      messageId,
+      label,
+      status: 'running',
+    },
+  };
+  activeJobs.set(job.state.id, job);
+  send(userId, { type: 'job_started', job: job.state });
+  void saveJobs(userId, chatId);
+  return job;
+}
+
+function updateJob(job: BackendJob | undefined, patch: Partial<TrackerJobState>): void {
+  if (!job) return;
+  job.state = { ...job.state, ...patch };
+  activeJobs.set(job.state.id, job);
+  send(job.userId, { type: 'job_progress', job: job.state });
+  void saveJobs(job.userId, job.state.chatId);
+}
+
+function finishJob(job: BackendJob, status: 'complete' | 'failed', error?: string): void {
+  job.state = { ...job.state, status, ...(error ? { error } : {}) };
+  send(job.userId, status === 'complete' ? { type: 'job_finished', job: job.state } : { type: 'job_failed', job: job.state });
+  activeJobs.delete(job.state.id);
+  void saveJobs(job.userId, job.state.chatId);
+}
+
+async function saveJobs(userId: string, chatId: string): Promise<void> {
+  const jobs = [...activeJobs.values()]
+    .filter((job) => job.userId === userId && job.state.chatId === chatId)
+    .map((job) => job.state);
+  await spindle.userStorage.setJson(jobsPath(chatId), { chatId, jobs, updatedAt: Date.now() }, { indent: 2, userId }).catch(() => {});
 }
 
 function parsePayloadJson(value: unknown): unknown {
@@ -424,109 +686,190 @@ function parsePayloadJson(value: unknown): unknown {
   return parseJsonTrackerResponse(value).data;
 }
 
-spindle.onFrontendMessage(async (payload: any, userId: string | undefined) => {
+async function runJob(userId: string, chatId: string | undefined, messageId: string | undefined, label: string, work: (job: BackendJob) => Promise<void>): Promise<void> {
+  const resolvedChatId = chatId || (await spindle.chats.getActive(userId))?.id;
+  if (!resolvedChatId) throw new Error('No active chat is open.');
+  const job = createJob(userId, resolvedChatId, messageId, label);
+  lastErrors.delete(userId);
+  await sendState(userId, resolvedChatId);
+  try {
+    await work(job);
+    finishJob(job, 'complete');
+    await sendState(userId, resolvedChatId);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    lastErrors.set(userId, message);
+    finishJob(job, 'failed', message);
+    spindle.toast.error(message, { title: 'Tracktor', duration: 10000 });
+    await sendState(userId, resolvedChatId);
+  }
+}
+
+spindle.onFrontendMessage(async (payload: FrontendMessage, rawUserId: string | undefined) => {
+  const chatId = typeof payload?.chatId === 'string' ? payload.chatId : null;
+  setUserFromFrontend(rawUserId, chatId);
+  if (!rawUserId) {
+    await addDiagnostic(null, 'Tracktor received a frontend message without a Lumiverse userId.');
+    return;
+  }
+  const userId = rawUserId;
+
   try {
     switch (payload?.type) {
+      case 'ready':
+      case 'refresh_state':
       case 'get_state':
-        await sendState(userId);
+        await sendState(userId, chatId);
         break;
 
       case 'save_settings': {
-        await saveSettings(payload.settings);
+        await saveSettings(payload.settings, userId);
         spindle.toast.success('Settings saved.', { title: 'Tracktor' });
-        await sendState(userId);
+        await sendState(userId, chatId);
         break;
       }
 
       case 'set_chat_schema': {
         if (!payload.chatId || !payload.schemaId) throw new Error('chatId and schemaId are required.');
-        await saveChatConfig(payload.chatId, { schemaId: payload.schemaId });
+        await saveChatConfig(userId, payload.chatId, { schemaPresetKey: payload.schemaId, schemaId: payload.schemaId });
         spindle.toast.success('Chat schema updated.', { title: 'Tracktor' });
-        await sendState(userId);
+        await sendState(userId, payload.chatId);
         break;
       }
 
       case 'generate_tracker':
-        await setBusy(async () => {
+      case 'regenerate_tracker':
+        await runJob(userId, payload.chatId, payload.messageId, 'Generating tracker', async (job) => {
           await generateTrackerForMessage({
             chatId: payload.chatId,
             messageId: payload.messageId,
             sequential: payload.sequential,
             userId,
+            job,
           });
           spindle.toast.success('Tracker generated.', { title: 'Tracktor' });
-        }, userId);
+        });
         break;
 
+      case 'regenerate_part':
+        if (!payload.chatId || !payload.messageId || !payload.partKey) throw new Error('chatId, messageId, and partKey are required.');
+        await runJob(userId, payload.chatId, payload.messageId, `Regenerating ${payload.partKey}`, async () => {
+          await regeneratePart(userId, payload.chatId, payload.messageId, payload.partKey);
+          spindle.toast.success('Tracker section regenerated.', { title: 'Tracktor' });
+        });
+        break;
+
+      case 'edit_snapshot':
       case 'update_tracker':
-        await setBusy(async () => {
-          await updateTrackerData(payload.chatId, payload.messageId, parsePayloadJson(payload.data));
+        await runJob(userId, payload.chatId, payload.messageId, 'Saving tracker JSON', async () => {
+          await updateTrackerData(userId, payload.chatId, payload.messageId, parsePayloadJson(payload.data));
           spindle.toast.success('Tracker updated.', { title: 'Tracktor' });
-        }, userId);
+        });
         break;
 
+      case 'delete_snapshot':
       case 'delete_tracker':
-        await setBusy(async () => {
-          await deleteTracker(payload.chatId, payload.messageId);
+        await runJob(userId, payload.chatId, payload.messageId, 'Deleting tracker', async () => {
+          await deleteTracker(userId, payload.chatId, payload.messageId);
           spindle.toast.success('Tracker deleted.', { title: 'Tracktor' });
-        }, userId);
+        });
         break;
+
+      case 'cancel_job': {
+        const job = typeof payload.jobId === 'string' ? activeJobs.get(payload.jobId) : undefined;
+        if (job && job.userId === userId) job.controller.abort();
+        break;
+      }
+
+      case 'toggle_injection': {
+        const settings = await loadSettings(userId);
+        settings.injectTrackerSnapshots = !settings.injectTrackerSnapshots;
+        await saveSettings(settings, userId);
+        await sendState(userId, chatId);
+        break;
+      }
 
       default:
-        spindle.log.warn(`Unknown frontend message: ${JSON.stringify(payload)}`);
+        await addDiagnostic(userId, `Unknown frontend message: ${JSON.stringify(payload)}`);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    lastError = message;
+    lastErrors.set(userId, message);
     spindle.toast.error(message, { title: 'Tracktor', duration: 10000 });
-    await sendState(userId);
+    await addDiagnostic(userId, message);
+    await sendState(userId, chatId);
   }
 });
 
-spindle.on('CHARACTER_MESSAGE_RENDERED', async (payload: any) => {
-  const settings = await loadSettings();
-  if (settings.autoMode !== 'assistant_message') return;
-  try {
-    await generateTrackerForMessage({ chatId: payload.chatId, messageId: payload.messageId });
-    await sendState();
-  } catch (error) {
-    spindle.log.warn(`Auto tracker generation failed: ${error instanceof Error ? error.message : String(error)}`);
+function shouldAutoGenerate(settings: TracktorSettings, kind: 'responses' | 'inputs'): boolean {
+  return settings.autoMode === kind || settings.autoMode === 'both';
+}
+
+async function handleAutoGeneration(payload: any, eventUserId: string | undefined, kind: 'responses' | 'inputs'): Promise<void> {
+  const chatId = typeof payload?.chatId === 'string' ? payload.chatId : null;
+  const messageId = typeof payload?.messageId === 'string' ? payload.messageId : typeof payload?.message?.id === 'string' ? payload.message.id : undefined;
+  const userId = resolveUserId(chatId, eventUserId);
+  if (!chatId || !messageId || !userId) {
+    await addDiagnostic(userId, `Tracktor skipped ${kind} auto-generation because chat/user/message context was incomplete.`);
+    return;
   }
+  setUserFromFrontend(userId, chatId);
+  const settings = await loadSettings(userId);
+  if (!shouldAutoGenerate(settings, kind)) return;
+  await runJob(userId, chatId, messageId, `Auto tracker (${kind})`, async (job) => {
+    await generateTrackerForMessage({ userId, chatId, messageId, job });
+  });
+}
+
+spindle.on('CHARACTER_MESSAGE_RENDERED', (payload: any, userId?: string) => {
+  void handleAutoGeneration(payload, userId, 'responses');
 });
 
-spindle.on('USER_MESSAGE_RENDERED', async (payload: any) => {
-  const settings = await loadSettings();
-  if (settings.autoMode !== 'user_message') return;
-  try {
-    await generateTrackerForMessage({ chatId: payload.chatId, messageId: payload.messageId });
-    await sendState();
-  } catch (error) {
-    spindle.log.warn(`Auto tracker generation failed: ${error instanceof Error ? error.message : String(error)}`);
-  }
+spindle.on('USER_MESSAGE_RENDERED', (payload: any, userId?: string) => {
+  void handleAutoGeneration(payload, userId, 'inputs');
 });
 
-spindle.on('CHAT_CHANGED', async () => {
-  await sendState();
+spindle.on('CHAT_CHANGED', (payload: any, userId?: string) => {
+  const chatId = typeof payload?.chatId === 'string' ? payload.chatId : null;
+  const targetUserId = resolveUserId(chatId, userId);
+  if (!targetUserId) return;
+  setUserFromFrontend(targetUserId, chatId);
+  void sendState(targetUserId, chatId);
+});
+
+spindle.on('CHAT_SWITCHED', (payload: any, userId?: string) => {
+  const chatId = typeof payload?.chatId === 'string' ? payload.chatId : null;
+  const targetUserId = resolveUserId(chatId, userId);
+  if (!targetUserId) return;
+  setUserFromFrontend(targetUserId, chatId);
+  void sendState(targetUserId, chatId);
+});
+
+spindle.on('GENERATION_STARTED', (payload: any, userId?: string) => {
+  const chatId = typeof payload?.chatId === 'string' ? payload.chatId : null;
+  if (chatId && userId) setUserFromFrontend(userId, chatId);
 });
 
 function tryRegisterInterceptor(): void {
   if (interceptorRegistered || !hasPermission('interceptor')) return;
   spindle.registerInterceptor(async (messages: LlmMessageDTO[], context: any) => {
-    const settings = await loadSettings();
-    if (!settings.injection.enabled || settings.injection.includeLastTrackers <= 0) {
+    const chatId = typeof context?.chatId === 'string' ? context.chatId : null;
+    if (!chatId || context?.generationType === 'quiet') return messages;
+    const userId = resolveUserId(chatId, typeof context?.userId === 'string' ? context.userId : null);
+    if (!userId) {
+      await addDiagnostic(null, 'Tracktor skipped prompt injection because no userId was known for the chat.');
       return messages;
     }
-    const chatId = context?.chatId;
-    if (!chatId || !hasPermission('chat_mutation')) return messages;
-    const chatMessages = await spindle.chat.getMessages(chatId) as ChatMessageDTO[];
-    const trackers = collectPriorTrackers(chatMessages, settings.injection.includeLastTrackers);
-    if (trackers.length === 0) return messages;
-
-    const injected = trackers.map((tracker) => ({
-      role: settings.injection.role,
-      content: formatTrackerSnapshot(tracker, settings.injection.header || tracker.schemaName),
+    const settings = await loadSettings(userId);
+    if (!settings.injectTrackerSnapshots || settings.trackerSnapshotCount <= 0) return messages;
+    const snapshots = (await loadSnapshots(userId, chatId)).slice(-settings.trackerSnapshotCount);
+    if (snapshots.length === 0) return messages;
+    const transform = settings.snapshotTransformPresets[settings.snapshotTransformPresetKey] ?? settings.snapshotTransformPresets.default_json;
+    const injected = snapshots.map((snapshot) => ({
+      role: settings.snapshotRole,
+      ...(settings.injectAsVirtualCharacter ? { name: 'Tracker' } : {}),
+      content: formatTrackerSnapshot(snapshot, settings.snapshotHeader || snapshot.schemaPresetKey, transform),
     }));
-
     return {
       messages: [...injected, ...messages],
       breakdown: injected.map((_message, index) => ({
@@ -540,12 +883,10 @@ function tryRegisterInterceptor(): void {
 }
 
 spindle.permissions?.onChanged?.(({ permission, granted }: { permission: string; granted: boolean }) => {
-  if (permission === 'interceptor' && granted) {
-    tryRegisterInterceptor();
-  }
+  if (permission === 'interceptor' && granted) tryRegisterInterceptor();
 });
 
-void loadSettings().then(() => {
+void (async () => {
   tryRegisterInterceptor();
   spindle.log.info('Tracktor backend loaded.');
-});
+})();

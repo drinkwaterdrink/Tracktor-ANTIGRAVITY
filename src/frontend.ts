@@ -4,6 +4,7 @@ import {
   type TracktorSettings,
   DEFAULT_EXTRACTION_PROMPT,
   DEFAULT_SYSTEM_PROMPT,
+  defaultSettings,
   deepMergeSettings,
   escapeHtml,
   safePreview,
@@ -39,12 +40,17 @@ type SpindleFrontendContext = {
     };
     showConfirm(options: Record<string, unknown>): Promise<{ confirmed: boolean }>;
   };
+  events?: {
+    on(event: string, handler: (payload: unknown) => void): () => void;
+    emit?(event: string, payload?: unknown): void;
+  };
   messages?: {
     renderWidget(
       options: { messageId: string; widgetId: string; html: string },
       handler?: (message: any) => void,
     ): () => void;
   };
+  getActiveChat?(): { chatId?: string | null; id?: string | null } | null;
   sendToBackend(payload: unknown): void;
   onBackendMessage(handler: (payload: any) => void): () => void;
 };
@@ -52,6 +58,7 @@ type SpindleFrontendContext = {
 let state: FrontendState | undefined;
 let roots: HTMLElement[] = [];
 let ctxRef: SpindleFrontendContext;
+let lastKnownChatId: string | null = null;
 const widgetCleanups = new Map<string, () => void>();
 
 export function setup(ctx: SpindleFrontendContext) {
@@ -61,6 +68,7 @@ export function setup(ctx: SpindleFrontendContext) {
   const settingsRoot = tryCreateSettingsRoot(ctx);
   roots = uniqueRoots([placement.root, settingsRoot].filter((value): value is HTMLElement => !!value));
   roots.forEach((root) => root.classList.add('tracktor-root'));
+  render();
 
   const openAction = ctx.ui?.registerInputBarAction?.({
     id: 'open-tracktor',
@@ -70,7 +78,7 @@ export function setup(ctx: SpindleFrontendContext) {
   });
   const unbindOpenAction = openAction?.onClick(() => {
     placement.activate();
-    ctx.sendToBackend({ type: 'get_state' });
+    sendBackend({ type: 'refresh_state' });
   });
 
   const inputAction = ctx.ui?.registerInputBarAction?.({
@@ -80,21 +88,55 @@ export function setup(ctx: SpindleFrontendContext) {
     iconSvg: TRACKTOR_SMALL_ICON,
   });
   const unbindInputAction = inputAction?.onClick(() => {
-    ctx.sendToBackend({ type: 'generate_tracker' });
+    sendBackend({ type: 'generate_tracker' });
     placement.activate();
+  });
+
+  const toggleInjectionAction = ctx.ui?.registerInputBarAction?.({
+    id: 'toggle-tracktor-injection',
+    label: 'Toggle Tracker Injection',
+    enabled: true,
+    iconSvg: TRACKTOR_SMALL_ICON,
+  });
+  const unbindToggleInjectionAction = toggleInjectionAction?.onClick(() => {
+    sendBackend({ type: 'toggle_injection' });
   });
 
   const unbindBackend = ctx.onBackendMessage((payload) => {
     if (payload?.type === 'state') {
       state = payload.state;
+      lastKnownChatId = state?.activeChat?.id ?? lastKnownChatId;
       placement.setBadge(state?.activeChat?.trackers.length ? String(state.activeChat.trackers.length) : null);
       render();
       renderMessageWidgets();
+    } else if (payload?.type === 'diagnostic') {
+      if (!state) return;
+      state.diagnostics = [String(payload.message ?? 'Diagnostic'), ...(state.diagnostics ?? [])].slice(0, 12);
+      render();
+    } else if (payload?.type === 'job_started' || payload?.type === 'job_progress' || payload?.type === 'job_finished' || payload?.type === 'job_failed') {
+      sendBackend({ type: 'refresh_state' });
     }
   });
 
   const unbindActivate = placement.onActivate(() => {
-    ctx.sendToBackend({ type: 'get_state' });
+    sendBackend({ type: 'refresh_state' });
+  });
+
+  const eventCleanups = [
+    'CHAT_CHANGED',
+    'CHAT_SWITCHED',
+    'MESSAGE_SENT',
+    'MESSAGE_EDITED',
+    'MESSAGE_DELETED',
+    'MESSAGE_SWIPED',
+    'GENERATION_ENDED',
+  ].flatMap((eventName) => {
+    if (!ctx.events?.on) return [];
+    return [ctx.events.on(eventName, (payload) => {
+      const chatId = readChatId(payload);
+      if (typeof chatId !== 'undefined') lastKnownChatId = chatId;
+      sendBackend({ type: 'refresh_state', chatId: chatId ?? lastKnownChatId ?? undefined });
+    })];
   });
 
   roots.forEach((root) => {
@@ -103,7 +145,7 @@ export function setup(ctx: SpindleFrontendContext) {
     root.addEventListener('input', handleInput);
   });
 
-  ctx.sendToBackend({ type: 'get_state' });
+  sendBackend({ type: 'ready' });
 
   return () => {
     roots.forEach((root) => {
@@ -118,8 +160,11 @@ export function setup(ctx: SpindleFrontendContext) {
     inputAction?.destroy();
     unbindOpenAction?.();
     openAction?.destroy();
+    unbindToggleInjectionAction?.();
+    toggleInjectionAction?.destroy();
     unbindActivate();
     unbindBackend();
+    eventCleanups.forEach((cleanup) => cleanup());
     placement.destroy();
     removeStyle();
     ctx.dom.cleanup();
@@ -137,23 +182,55 @@ type TracktorPlacement = {
 function createPlacement(ctx: SpindleFrontendContext): TracktorPlacement {
   const drawerTab = tryCreateDrawerTab(ctx);
   if (drawerTab) {
-    const cleanupLauncher = createFloatingLauncher(ctx, () => drawerTab.activate());
     return {
       root: drawerTab.root,
       activate: drawerTab.activate,
       setBadge(text) {
         drawerTab.setBadge(text);
-        cleanupLauncher.setBadge(text);
       },
       onActivate: drawerTab.onActivate,
       destroy() {
-        cleanupLauncher.destroy();
         drawerTab.destroy();
       },
     };
   }
 
   return createFallbackPanel(ctx);
+}
+
+function sendBackend(payload: Record<string, unknown>): void {
+  const chatId = payload.chatId ?? getActiveChatId();
+  if (typeof chatId === 'string' && chatId) {
+    lastKnownChatId = chatId;
+    ctxRef.sendToBackend({ ...payload, chatId });
+    return;
+  }
+  ctxRef.sendToBackend(payload);
+}
+
+function getActiveChatId(): string | undefined {
+  try {
+    const active = ctxRef.getActiveChat?.();
+    const chatId = active?.chatId ?? active?.id ?? lastKnownChatId ?? undefined;
+    return typeof chatId === 'string' && chatId ? chatId : undefined;
+  } catch {
+    return lastKnownChatId ?? undefined;
+  }
+}
+
+function readChatId(payload: unknown): string | null | undefined {
+  if (!payload || typeof payload !== 'object') return undefined;
+  const obj = payload as Record<string, unknown>;
+  if (typeof obj.chatId === 'string') return obj.chatId;
+  if (typeof obj.chat_id === 'string') return obj.chat_id;
+  if (obj.chatId === null || obj.chat_id === null) return null;
+  const message = obj.message;
+  if (message && typeof message === 'object') {
+    const nested = message as Record<string, unknown>;
+    if (typeof nested.chatId === 'string') return nested.chatId;
+    if (typeof nested.chat_id === 'string') return nested.chat_id;
+  }
+  return undefined;
 }
 
 function tryCreateDrawerTab(ctx: SpindleFrontendContext): TracktorPlacement | undefined {
@@ -196,7 +273,7 @@ function createFloatingLauncher(ctx: SpindleFrontendContext, activate: () => voi
     : launcher.querySelector('.tracktor-floating-launcher');
   const onClick = () => {
     activate();
-    ctx.sendToBackend({ type: 'get_state' });
+    sendBackend({ type: 'refresh_state' });
   };
   button?.addEventListener('click', onClick);
 
@@ -333,12 +410,30 @@ function render(): void {
   if (roots.length === 0) return;
   for (const root of roots) {
     if (!state) {
-      root.innerHTML = '<div class="tracktor-empty">Loading Tracktor...</div>';
+      root.innerHTML = `
+        <div class="tracktor-shell">
+          ${renderHeader()}
+          <section class="tracktor-section tracktor-toolbar">
+            <div>
+              <strong>Connecting to Tracktor</strong>
+              <span>The backend state has not arrived yet. You can still refresh or open extension settings.</span>
+            </div>
+            <div class="tracktor-actions">
+              <button type="button" data-action="refresh">Refresh</button>
+              <button type="button" data-action="open-extension-settings">Extension Settings</button>
+            </div>
+          </section>
+          <div class="tracktor-empty">Loading Tracktor state...</div>
+          ${renderSettings(defaultSettings)}
+          ${renderSchemaEditor(defaultSettings)}
+        </div>
+      `;
       continue;
     }
 
     root.innerHTML = `
       <div class="tracktor-shell">
+        ${renderHeader()}
         ${renderStatus(state)}
         ${renderToolbar(state)}
         ${renderTrackers(state)}
@@ -349,13 +444,35 @@ function render(): void {
   }
 }
 
+function renderHeader(): string {
+  return `
+    <header class="tracktor-header">
+      <div>
+        <strong>Tracktor</strong>
+        <span>Schema tracker snapshots for Lumiverse chats</span>
+      </div>
+      <div class="tracktor-tabs" aria-label="Tracktor sections">
+        <span>Current</span>
+        <span>Settings</span>
+        <span>Schema</span>
+        <span>Diagnostics</span>
+      </div>
+    </header>
+  `;
+}
+
 function renderStatus(current: FrontendState): string {
   const warnings = current.permissionWarnings.length
     ? `<div class="tracktor-warning">Grant permissions in Lumiverse Extensions: ${current.permissionWarnings.map(escapeHtml).join(', ')}</div>`
     : '';
   const error = current.lastError ? `<div class="tracktor-error">${escapeHtml(current.lastError)}</div>` : '';
-  const busy = current.busy ? '<div class="tracktor-busy">Working...</div>' : '';
-  return `${warnings}${error}${busy}`;
+  const jobs = current.jobs?.length
+    ? `<div class="tracktor-busy">${current.jobs.map((job) => `${escapeHtml(job.label)}${job.totalParts ? ` ${job.currentPart ?? 0}/${job.totalParts}` : ''}`).join('<br>')}</div>`
+    : current.busy ? '<div class="tracktor-busy">Working...</div>' : '';
+  const diagnostics = current.diagnostics?.length
+    ? `<details class="tracktor-diagnostics"><summary>Diagnostics</summary>${current.diagnostics.map((item) => `<p>${escapeHtml(item)}</p>`).join('')}</details>`
+    : '';
+  return `${warnings}${error}${jobs}${diagnostics}`;
 }
 
 function renderToolbar(current: FrontendState): string {
@@ -395,6 +512,9 @@ function renderTrackers(current: FrontendState): string {
 }
 
 function renderTrackerItem(item: TrackerSummary): string {
+  const partButtons = (item.snapshot.partsOrder ?? []).map((partKey) => (
+    `<button type="button" data-action="regenerate-part" data-chat-id="${escapeHtml(item.chatId)}" data-message-id="${escapeHtml(item.messageId)}" data-part-key="${escapeHtml(partKey)}">${escapeHtml(partKey)}</button>`
+  )).join('');
   return `
     <article class="tracktor-item" data-chat-id="${escapeHtml(item.chatId)}" data-message-id="${escapeHtml(item.messageId)}">
       <div class="tracktor-item-head">
@@ -408,6 +528,7 @@ function renderTrackerItem(item: TrackerSummary): string {
           <button type="button" data-action="delete" data-chat-id="${escapeHtml(item.chatId)}" data-message-id="${escapeHtml(item.messageId)}">Delete</button>
         </div>
       </div>
+      ${partButtons ? `<details class="tracktor-parts"><summary>Regenerate section</summary><div class="tracktor-actions">${partButtons}</div></details>` : ''}
       <div class="tracktor-rendered">${stripDangerousHtml(item.tracker.renderedHtml)}</div>
     </article>
   `;
@@ -418,21 +539,33 @@ function renderSettings(settings: TracktorSettings): string {
     <section class="tracktor-section">
       <h2>Settings</h2>
       <div class="tracktor-form-grid">
-        <label>Generation mode
-          <select data-setting="generationMode">
-            <option value="json" ${settings.generationMode === 'json' ? 'selected' : ''}>Prompted JSON</option>
-            <option value="native_json" ${settings.generationMode === 'native_json' ? 'selected' : ''}>Native JSON schema</option>
+        <label>Structured output
+          <select data-setting="structuredOutputMode">
+            <option value="json_prompt" ${settings.structuredOutputMode === 'json_prompt' ? 'selected' : ''}>Prompted JSON</option>
+            <option value="native_json_schema" ${settings.structuredOutputMode === 'native_json_schema' ? 'selected' : ''}>Native JSON schema</option>
+            <option value="xml_prompt" ${settings.structuredOutputMode === 'xml_prompt' ? 'selected' : ''}>XML prompt fallback</option>
+            <option value="toon_prompt" ${settings.structuredOutputMode === 'toon_prompt' ? 'selected' : ''}>TOON prompt fallback</option>
           </select>
         </label>
         <label>Auto mode
           <select data-setting="autoMode">
-            <option value="off" ${settings.autoMode === 'off' ? 'selected' : ''}>Off</option>
-            <option value="assistant_message" ${settings.autoMode === 'assistant_message' ? 'selected' : ''}>After assistant messages</option>
-            <option value="user_message" ${settings.autoMode === 'user_message' ? 'selected' : ''}>After user messages</option>
+            <option value="none" ${settings.autoMode === 'none' ? 'selected' : ''}>None</option>
+            <option value="responses" ${settings.autoMode === 'responses' ? 'selected' : ''}>Responses</option>
+            <option value="inputs" ${settings.autoMode === 'inputs' ? 'selected' : ''}>Inputs</option>
+            <option value="both" ${settings.autoMode === 'both' ? 'selected' : ''}>Both</option>
           </select>
         </label>
+        <label>Tracker connection id
+          <input data-setting="trackerConnectionId" value="${escapeHtml(settings.trackerConnectionId ?? '')}" placeholder="Use active connection">
+        </label>
+        <label>Tracker preset id
+          <input data-setting="trackerPresetId" value="${escapeHtml(settings.trackerPresetId ?? '')}" placeholder="Optional">
+        </label>
         <label>Recent messages
-          <input data-setting="includeLastMessages" type="number" min="1" max="200" value="${settings.includeLastMessages}">
+          <input data-setting="trackerContextMessageLimit" type="number" min="0" max="400" value="${settings.trackerContextMessageLimit}">
+        </label>
+        <label>Skip first messages
+          <input data-setting="skipFirstMessages" type="number" min="0" max="1000" value="${settings.skipFirstMessages}">
         </label>
         <label>Tracker context
           <input data-setting="includeLastTrackers" type="number" min="0" max="25" value="${settings.includeLastTrackers}">
@@ -441,21 +574,35 @@ function renderSettings(settings: TracktorSettings): string {
           <input data-setting="maxResponseTokens" type="number" min="1" max="64000" value="${settings.maxResponseTokens}">
         </label>
         <label class="tracktor-check">
-          <input data-setting="sequentialPartGeneration" type="checkbox" ${settings.sequentialPartGeneration ? 'checked' : ''}>
+          <input data-setting="sequentialGeneration" type="checkbox" ${settings.sequentialGeneration ? 'checked' : ''}>
           Sequential part generation
         </label>
         <label class="tracktor-check">
-          <input data-setting="injection.enabled" type="checkbox" ${settings.injection.enabled ? 'checked' : ''}>
+          <input data-setting="injectTrackerSnapshots" type="checkbox" ${settings.injectTrackerSnapshots ? 'checked' : ''}>
           Inject snapshots into normal generations
         </label>
         <label>Injected snapshots
-          <input data-setting="injection.includeLastTrackers" type="number" min="0" max="25" value="${settings.injection.includeLastTrackers}">
+          <input data-setting="trackerSnapshotCount" type="number" min="0" max="25" value="${settings.trackerSnapshotCount}">
         </label>
         <label>Injection role
-          <select data-setting="injection.role">
-            <option value="system" ${settings.injection.role === 'system' ? 'selected' : ''}>System</option>
-            <option value="user" ${settings.injection.role === 'user' ? 'selected' : ''}>User</option>
-            <option value="assistant" ${settings.injection.role === 'assistant' ? 'selected' : ''}>Assistant</option>
+          <select data-setting="snapshotRole">
+            <option value="system" ${settings.snapshotRole === 'system' ? 'selected' : ''}>System</option>
+            <option value="user" ${settings.snapshotRole === 'user' ? 'selected' : ''}>User</option>
+            <option value="assistant" ${settings.snapshotRole === 'assistant' ? 'selected' : ''}>Assistant</option>
+          </select>
+        </label>
+        <label>Conversation roles
+          <select data-setting="trackerConversationRoleMode">
+            <option value="preserve" ${settings.trackerConversationRoleMode === 'preserve' ? 'selected' : ''}>Preserve</option>
+            <option value="all_assistant" ${settings.trackerConversationRoleMode === 'all_assistant' ? 'selected' : ''}>All assistant</option>
+            <option value="plain_transcript" ${settings.trackerConversationRoleMode === 'plain_transcript' ? 'selected' : ''}>Plain transcript</option>
+          </select>
+        </label>
+        <label>Snapshot transform
+          <select data-setting="snapshotTransformPresetKey">
+            <option value="default_json" ${settings.snapshotTransformPresetKey === 'default_json' ? 'selected' : ''}>Default JSON</option>
+            <option value="minimal" ${settings.snapshotTransformPresetKey === 'minimal' ? 'selected' : ''}>Minimal</option>
+            <option value="toon" ${settings.snapshotTransformPresetKey === 'toon' ? 'selected' : ''}>TOON</option>
           </select>
         </label>
         <label>Chat variable key
@@ -466,7 +613,7 @@ function renderSettings(settings: TracktorSettings): string {
         <textarea data-setting="systemPrompt" rows="5">${escapeHtml(settings.systemPrompt)}</textarea>
       </label>
       <label>Extraction prompt
-        <textarea data-setting="extractionPrompt" rows="4">${escapeHtml(settings.extractionPrompt)}</textarea>
+        <textarea data-setting="trackerInstructionPrompt" rows="4">${escapeHtml(settings.trackerInstructionPrompt)}</textarea>
       </label>
       <div class="tracktor-actions">
         <button type="button" data-action="save-settings">Save Settings</button>
@@ -484,7 +631,7 @@ function renderSchemaEditor(settings: TracktorSettings): string {
       <h2>Schema</h2>
       <div class="tracktor-form-grid">
         <label>Active preset
-          <select data-setting="activeSchemaId">
+          <select data-setting="activeSchemaPresetKey">
             ${presets.map((preset) => `<option value="${escapeHtml(preset.id)}" ${preset.id === active.id ? 'selected' : ''}>${escapeHtml(preset.name)}</option>`).join('')}
           </select>
         </label>
@@ -512,17 +659,23 @@ function renderSchemaEditor(settings: TracktorSettings): string {
 function handleClick(event: Event): void {
   const target = event.target as HTMLElement | null;
   const button = target?.closest('[data-action]') as HTMLElement | null;
-  if (!button || !state) return;
+  if (!button) return;
   const action = button.dataset.action;
 
   if (action === 'refresh') {
-    ctxRef.sendToBackend({ type: 'get_state' });
+    sendBackend({ type: 'refresh_state' });
+  } else if (action === 'open-extension-settings') {
+    ctxRef.events?.emit?.('open-settings', { view: 'extensions' });
+  } else if (!state) {
+    return;
   } else if (action === 'generate-latest') {
-    ctxRef.sendToBackend({ type: 'generate_tracker', chatId: state.activeChat?.id });
+    sendBackend({ type: 'generate_tracker', chatId: state.activeChat?.id });
   } else if (action === 'generate-latest-sequential') {
-    ctxRef.sendToBackend({ type: 'generate_tracker', chatId: state.activeChat?.id, sequential: true });
+    sendBackend({ type: 'generate_tracker', chatId: state.activeChat?.id, sequential: true });
   } else if (action === 'regenerate') {
-    ctxRef.sendToBackend({ type: 'generate_tracker', chatId: button.dataset.chatId, messageId: button.dataset.messageId });
+    sendBackend({ type: 'regenerate_tracker', chatId: button.dataset.chatId, messageId: button.dataset.messageId });
+  } else if (action === 'regenerate-part') {
+    sendBackend({ type: 'regenerate_part', chatId: button.dataset.chatId, messageId: button.dataset.messageId, partKey: button.dataset.partKey });
   } else if (action === 'edit') {
     openEditModal(button.dataset.chatId, button.dataset.messageId);
   } else if (action === 'delete') {
@@ -534,10 +687,10 @@ function handleClick(event: Event): void {
   } else if (action === 'save-schema') {
     saveSchemaFromDom(getRootForAction(button));
   } else if (action === 'use-schema-for-chat') {
-    ctxRef.sendToBackend({
+    sendBackend({
       type: 'set_chat_schema',
       chatId: state.activeChat?.id,
-      schemaId: state.settings.activeSchemaId,
+      schemaId: state.settings.activeSchemaPresetKey,
     });
   }
 }
@@ -582,6 +735,7 @@ function restoreDefaultPrompts(): void {
   if (!state) return;
   state.settings.systemPrompt = DEFAULT_SYSTEM_PROMPT;
   state.settings.extractionPrompt = DEFAULT_EXTRACTION_PROMPT;
+  state.settings.trackerInstructionPrompt = DEFAULT_EXTRACTION_PROMPT;
   ctxRef.sendToBackend({ type: 'save_settings', settings: deepMergeSettings(state.settings) });
   render();
 }
@@ -600,10 +754,16 @@ function saveSchemaFromDom(sourceRoot: HTMLElement): void {
     const settings = structuredClone(state.settings);
     settings.schemaPresets[id] = {
       id,
+      key: id,
       name: nameInput.value.trim() || id,
       schema,
+      jsonSchema: schema,
       templateHtml: templateInput.value,
+      renderTemplate: templateInput.value,
+      createdAt: state.settings.schemaPresets[id]?.createdAt ?? Date.now(),
+      updatedAt: Date.now(),
     };
+    settings.activeSchemaPresetKey = id;
     settings.activeSchemaId = id;
     ctxRef.sendToBackend({ type: 'save_settings', settings });
   } catch (error) {
@@ -624,7 +784,7 @@ function openEditModal(chatId?: string, messageId?: string): void {
     if (next === null) return;
     try {
       JSON.parse(next);
-      ctxRef.sendToBackend({ type: 'update_tracker', chatId, messageId, data: next });
+      sendBackend({ type: 'edit_snapshot', chatId, messageId, data: next });
     } catch (error) {
       showErrorModal(error instanceof Error ? error.message : String(error));
     }
@@ -652,7 +812,7 @@ function openEditModal(chatId?: string, messageId?: string): void {
     if (!textarea) return;
     try {
       JSON.parse(textarea.value);
-      ctxRef.sendToBackend({ type: 'update_tracker', chatId, messageId, data: textarea.value });
+      sendBackend({ type: 'edit_snapshot', chatId, messageId, data: textarea.value });
       modal.dismiss();
     } catch (error) {
       showErrorModal(error instanceof Error ? error.message : String(error));
@@ -671,7 +831,7 @@ async function confirmDelete(chatId?: string, messageId?: string): Promise<void>
       })
     : { confirmed: window.confirm('Delete tracker data from this message?') };
   if (confirmed) {
-    ctxRef.sendToBackend({ type: 'delete_tracker', chatId, messageId });
+    sendBackend({ type: 'delete_snapshot', chatId, messageId });
   }
 }
 
@@ -686,7 +846,12 @@ function showErrorModal(message: string): void {
 }
 
 function renderMessageWidgets(): void {
-  if (!ctxRef.messages || !state?.activeChat) return;
+  if (!ctxRef.messages) return;
+  if (!state?.activeChat) {
+    for (const cleanup of widgetCleanups.values()) cleanup();
+    widgetCleanups.clear();
+    return;
+  }
   const activeIds = new Set(state.activeChat.trackers.map((item) => item.messageId));
   for (const [messageId, cleanup] of widgetCleanups.entries()) {
     if (!activeIds.has(messageId)) {
@@ -709,7 +874,7 @@ function renderMessageWidgets(): void {
       },
       (message) => {
         if (message?.type === 'regenerate') {
-          ctxRef.sendToBackend({ type: 'generate_tracker', chatId: tracker.chatId, messageId: tracker.messageId });
+          sendBackend({ type: 'regenerate_tracker', chatId: tracker.chatId, messageId: tracker.messageId });
         } else if (message?.type === 'edit') {
           openEditModal(tracker.chatId, tracker.messageId);
         } else if (message?.type === 'delete') {
@@ -844,6 +1009,33 @@ const STYLES = `
     overflow: auto;
   }
   .tracktor-shell { display: flex; flex-direction: column; gap: 10px; padding: 10px; }
+  .tracktor-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 10px;
+    border-bottom: 1px solid var(--lumiverse-border);
+    padding-bottom: 10px;
+  }
+  .tracktor-header span {
+    display: block;
+    color: var(--lumiverse-text-muted);
+    font-size: 11px;
+    margin-top: 2px;
+  }
+  .tracktor-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    justify-content: flex-end;
+  }
+  .tracktor-tabs span {
+    border: 1px solid var(--lumiverse-border);
+    border-radius: 6px;
+    padding: 4px 6px;
+    color: var(--lumiverse-text);
+    background: var(--lumiverse-fill-subtle);
+  }
   .tracktor-section { border-top: 1px solid var(--lumiverse-border); padding-top: 10px; }
   .tracktor-section:first-child { border-top: 0; padding-top: 0; }
   .tracktor-section h2 { font-size: 13px; margin: 0 0 8px; font-weight: 650; }
@@ -868,6 +1060,8 @@ const STYLES = `
   .tracktor-item { border: 1px solid var(--lumiverse-border); background: var(--lumiverse-fill-subtle); border-radius: 8px; padding: 9px; }
   .tracktor-item-head { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
   .tracktor-rendered { font-size: 12px; }
+  .tracktor-parts { margin: 7px 0; }
+  .tracktor-parts summary { cursor: pointer; font-size: 12px; color: var(--lumiverse-text-muted); }
   .tracktor-rendered table { width: 100%; border-collapse: collapse; }
   .tracktor-rendered td { border-top: 1px solid var(--lumiverse-border); padding: 4px 6px; vertical-align: top; }
   .tracktor-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
@@ -885,6 +1079,14 @@ const STYLES = `
   .tracktor-warning { color: #d8a72d; }
   .tracktor-error, .tracktor-error-text { color: #e46c6c; }
   .tracktor-busy { color: var(--lumiverse-accent); }
+  .tracktor-diagnostics {
+    border: 1px solid var(--lumiverse-border);
+    background: var(--lumiverse-fill-subtle);
+    border-radius: 8px;
+    padding: 8px;
+    font-size: 12px;
+  }
+  .tracktor-diagnostics p { margin: 6px 0 0; color: var(--lumiverse-text-muted); }
   .tracktor-modal-body { display: flex; flex-direction: column; gap: 8px; }
   .tracktor-json-editor { min-height: 420px; width: 100%; box-sizing: border-box; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   @media (max-width: 680px) {

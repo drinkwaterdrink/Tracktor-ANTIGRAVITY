@@ -1,9 +1,29 @@
 // src/shared.ts
 var METADATA_KEY = "tracktor";
 var SETTINGS_PATH = "settings.json";
-var VERSION = "0.1.2";
+var SCHEMA_PRESETS_PATH = "schema-presets.json";
+var DIAGNOSTICS_PATH = "diagnostics/latest.json";
+var VERSION = "0.2.0";
 var DEFAULT_SYSTEM_PROMPT = `You are a structured tracker extraction assistant. Analyze the conversation and return only tracker data that matches the requested schema. Do not roleplay, continue the scene, explain yourself, or include markdown unless the tracker format instructions explicitly ask for it. Preserve continuity with previous tracker snapshots, but update the tracker from the newest chat evidence.`;
 var DEFAULT_EXTRACTION_PROMPT = `Create a complete tracker update for the target message. Fill every required field. If a field is not explicitly stated, infer a short, reasonable value from the conversation context. Keep values concise and concrete.`;
+var DEFAULT_JSON_PROMPT_TEMPLATE = [
+  "Return only one valid JSON object.",
+  "Do not include markdown fences, commentary, or prose outside JSON.",
+  "The object must conform to this JSON Schema:",
+  "{{schema}}",
+  "Example shape:",
+  "{{example_response}}"
+].join("\n\n");
+var DEFAULT_XML_PROMPT_TEMPLATE = [
+  "Return tracker data as valid JSON even if the model was asked for XML-style structure.",
+  "Use this schema as the authority:",
+  "{{schema}}"
+].join("\n\n");
+var DEFAULT_TOON_PROMPT_TEMPLATE = [
+  "Return tracker data as valid JSON. Keep values compact like TOON, but the response must still parse as JSON.",
+  "Use this schema as the authority:",
+  "{{schema}}"
+].join("\n\n");
 var DEFAULT_SCHEMA = {
   $schema: "http://json-schema.org/draft-07/schema#",
   title: "SceneTracker",
@@ -78,26 +98,84 @@ var DEFAULT_TEMPLATE_HTML = `
   </details>
 </section>
 `.trim();
+var defaultSchemaPresets = {
+  scene: normalizeSchemaPreset({
+    key: "scene",
+    id: "scene",
+    name: "Scene Tracker",
+    description: "General roleplay scene state.",
+    jsonSchema: DEFAULT_SCHEMA,
+    schema: DEFAULT_SCHEMA,
+    renderTemplate: DEFAULT_TEMPLATE_HTML,
+    templateHtml: DEFAULT_TEMPLATE_HTML
+  }, "scene")
+};
+var defaultSnapshotTransformPresets = {
+  default_json: {
+    key: "default_json",
+    name: "Default JSON",
+    input: "pretty_json",
+    regexPattern: "",
+    regexFlags: "",
+    replacement: "",
+    codeFenceLang: "json",
+    wrapInCodeFence: true
+  },
+  minimal: {
+    key: "minimal",
+    name: "Minimal Lines",
+    input: "top_level_lines",
+    regexPattern: "",
+    regexFlags: "",
+    replacement: "",
+    codeFenceLang: "",
+    wrapInCodeFence: false
+  },
+  toon: {
+    key: "toon",
+    name: "TOON",
+    input: "toon",
+    regexPattern: "",
+    regexFlags: "",
+    replacement: "",
+    codeFenceLang: "toon",
+    wrapInCodeFence: true
+  }
+};
 var defaultSettings = {
   version: VERSION,
+  schemaPresets: structuredClone(defaultSchemaPresets),
+  activeSchemaPresetKey: "scene",
   activeSchemaId: "scene",
-  schemaPresets: {
-    scene: {
-      id: "scene",
-      name: "Scene Tracker",
-      description: "General roleplay scene state.",
-      schema: DEFAULT_SCHEMA,
-      templateHtml: DEFAULT_TEMPLATE_HTML
-    }
-  },
-  generationMode: "json",
-  maxResponseTokens: 1800,
+  trackerConnectionId: null,
+  trackerPresetId: null,
+  autoMode: "none",
+  sequentialGeneration: false,
+  sequentialPartGeneration: false,
+  maxResponseTokens: 4096,
+  skipFirstMessages: 0,
+  trackerContextMessageLimit: 12,
   includeLastMessages: 12,
   includeLastTrackers: 1,
-  sequentialPartGeneration: false,
-  autoMode: "off",
+  includeCharacterCardInTrackerPrompt: false,
+  trackerConversationRoleMode: "preserve",
+  structuredOutputMode: "json_prompt",
+  generationMode: "json",
   systemPrompt: DEFAULT_SYSTEM_PROMPT,
   extractionPrompt: DEFAULT_EXTRACTION_PROMPT,
+  trackerInstructionPrompt: DEFAULT_EXTRACTION_PROMPT,
+  jsonPromptTemplate: DEFAULT_JSON_PROMPT_TEMPLATE,
+  xmlPromptTemplate: DEFAULT_XML_PROMPT_TEMPLATE,
+  toonPromptTemplate: DEFAULT_TOON_PROMPT_TEMPLATE,
+  trackerSystemPromptSource: "saved_tracker_prompt",
+  savedTrackerPromptId: null,
+  injectTrackerSnapshots: true,
+  trackerSnapshotCount: 1,
+  snapshotRole: "system",
+  injectAsVirtualCharacter: false,
+  snapshotHeader: "Recent tracker snapshot",
+  snapshotTransformPresetKey: "default_json",
+  snapshotTransformPresets: structuredClone(defaultSnapshotTransformPresets),
   injection: {
     enabled: true,
     includeLastTrackers: 1,
@@ -108,68 +186,147 @@ var defaultSettings = {
     enabled: true,
     key: "tracktor"
   },
+  trackerWorldBookMode: "include_all",
+  allowedWorldBookIds: [],
+  allowedWorldBookEntryIds: [],
   debugLogging: false
 };
-function deepMergeSettings(input) {
+function deepMergeSettings(input, schemaPresets) {
   const saved = isPlainObject(input) ? input : {};
   const merged = structuredClone(defaultSettings);
   assignKnown(merged, saved, [
     "version",
-    "activeSchemaId",
-    "generationMode",
+    "trackerConnectionId",
+    "trackerPresetId",
     "maxResponseTokens",
+    "skipFirstMessages",
+    "trackerContextMessageLimit",
     "includeLastMessages",
     "includeLastTrackers",
-    "sequentialPartGeneration",
-    "autoMode",
+    "includeCharacterCardInTrackerPrompt",
     "systemPrompt",
     "extractionPrompt",
+    "trackerInstructionPrompt",
+    "jsonPromptTemplate",
+    "xmlPromptTemplate",
+    "toonPromptTemplate",
+    "trackerSystemPromptSource",
+    "savedTrackerPromptId",
+    "injectTrackerSnapshots",
+    "trackerSnapshotCount",
+    "injectAsVirtualCharacter",
+    "snapshotHeader",
     "debugLogging"
   ]);
-  if (isPlainObject(saved.schemaPresets)) {
-    merged.schemaPresets = {};
-    for (const [id, value] of Object.entries(saved.schemaPresets)) {
-      if (!isPlainObject(value)) continue;
-      const preset = value;
-      if (!isPlainObject(preset.schema) || typeof preset.templateHtml !== "string") continue;
-      const normalizedId = sanitizeId(typeof preset.id === "string" ? preset.id : id) || id;
-      merged.schemaPresets[normalizedId] = {
-        id: normalizedId,
-        name: typeof preset.name === "string" && preset.name.trim() ? preset.name : normalizedId,
-        description: typeof preset.description === "string" ? preset.description : void 0,
-        schema: preset.schema,
-        templateHtml: preset.templateHtml
-      };
-    }
-    if (Object.keys(merged.schemaPresets).length === 0) {
-      merged.schemaPresets = structuredClone(defaultSettings.schemaPresets);
-    }
+  merged.schemaPresets = sanitizeSchemaPresetMap(schemaPresets ?? saved.schemaPresets);
+  merged.activeSchemaPresetKey = sanitizeId(readString(saved.activeSchemaPresetKey) || readString(saved.activeSchemaId) || merged.activeSchemaPresetKey) || "scene";
+  merged.activeSchemaId = merged.activeSchemaPresetKey;
+  merged.autoMode = normalizeAutoMode(saved.autoMode);
+  merged.sequentialGeneration = readBool(saved.sequentialGeneration, readBool(saved.sequentialPartGeneration, merged.sequentialGeneration));
+  merged.sequentialPartGeneration = merged.sequentialGeneration;
+  merged.structuredOutputMode = normalizeStructuredOutputMode(saved.structuredOutputMode ?? saved.generationMode);
+  merged.generationMode = merged.structuredOutputMode === "native_json_schema" ? "native_json" : "json";
+  merged.trackerConversationRoleMode = normalizeEnum(saved.trackerConversationRoleMode, ["preserve", "all_assistant", "plain_transcript"], "preserve");
+  merged.snapshotRole = normalizeEnum(saved.snapshotRole, ["system", "user", "assistant"], "system");
+  merged.trackerWorldBookMode = normalizeEnum(saved.trackerWorldBookMode, ["include_all", "exclude_all", "allowlist"], "include_all");
+  merged.snapshotTransformPresetKey = normalizeEnum(saved.snapshotTransformPresetKey, ["default_json", "minimal", "toon", "custom"], "default_json");
+  merged.allowedWorldBookIds = sanitizeStringArray(saved.allowedWorldBookIds);
+  merged.allowedWorldBookEntryIds = sanitizeStringArray(saved.allowedWorldBookEntryIds);
+  if (saved.trackerContextMessageLimit === void 0 && saved.includeLastMessages !== void 0) {
+    merged.trackerContextMessageLimit = saved.includeLastMessages;
+  }
+  if (saved.trackerInstructionPrompt === void 0 && typeof saved.extractionPrompt === "string") {
+    merged.trackerInstructionPrompt = saved.extractionPrompt;
+  }
+  if (isPlainObject(saved.snapshotTransformPresets)) {
+    merged.snapshotTransformPresets = {
+      ...structuredClone(defaultSnapshotTransformPresets),
+      ...sanitizeSnapshotTransformPresets(saved.snapshotTransformPresets)
+    };
   }
   if (isPlainObject(saved.injection)) {
-    assignKnown(merged.injection, saved.injection, [
-      "enabled",
-      "includeLastTrackers",
-      "role",
-      "header"
-    ]);
+    const injection = saved.injection;
+    merged.injectTrackerSnapshots = readBool(injection.enabled, merged.injectTrackerSnapshots);
+    merged.trackerSnapshotCount = sanitizeInteger(injection.includeLastTrackers, merged.trackerSnapshotCount, 0, 25);
+    merged.snapshotRole = normalizeEnum(injection.role, ["system", "user", "assistant"], merged.snapshotRole);
+    merged.snapshotHeader = readString(injection.header) || merged.snapshotHeader;
   }
   if (isPlainObject(saved.chatVariableExport)) {
     assignKnown(merged.chatVariableExport, saved.chatVariableExport, ["enabled", "key"]);
   }
-  merged.activeSchemaId = merged.schemaPresets[merged.activeSchemaId] ? merged.activeSchemaId : Object.keys(merged.schemaPresets)[0];
-  merged.maxResponseTokens = sanitizeInteger(merged.maxResponseTokens, 1800, 1, 64e3);
-  merged.includeLastMessages = sanitizeInteger(merged.includeLastMessages, 12, 1, 200);
+  merged.maxResponseTokens = sanitizeInteger(merged.maxResponseTokens, 4096, 1, 64e3);
+  merged.skipFirstMessages = sanitizeInteger(merged.skipFirstMessages, 0, 0, 1e3);
+  merged.trackerContextMessageLimit = sanitizeInteger(merged.trackerContextMessageLimit, merged.includeLastMessages, 0, 400);
+  merged.includeLastMessages = merged.trackerContextMessageLimit;
   merged.includeLastTrackers = sanitizeInteger(merged.includeLastTrackers, 1, 0, 25);
-  merged.injection.includeLastTrackers = sanitizeInteger(merged.injection.includeLastTrackers, 1, 0, 25);
-  merged.generationMode = merged.generationMode === "native_json" ? "native_json" : "json";
-  merged.autoMode = ["off", "assistant_message", "user_message"].includes(merged.autoMode) ? merged.autoMode : "off";
-  merged.injection.role = ["system", "user", "assistant"].includes(merged.injection.role) ? merged.injection.role : "system";
-  merged.chatVariableExport.key = sanitizeVariableKey(merged.chatVariableExport.key) || "tracktor";
+  merged.trackerSnapshotCount = sanitizeInteger(merged.trackerSnapshotCount, 1, 0, 25);
+  merged.injection = {
+    enabled: merged.injectTrackerSnapshots,
+    includeLastTrackers: merged.trackerSnapshotCount,
+    role: merged.snapshotRole,
+    header: merged.snapshotHeader
+  };
+  merged.chatVariableExport.enabled = readBool(merged.chatVariableExport.enabled, true);
+  merged.chatVariableExport.key = sanitizeVariableKey(String(merged.chatVariableExport.key ?? "tracktor")) || "tracktor";
+  merged.trackerConnectionId = normalizeNullableString(merged.trackerConnectionId);
+  merged.trackerPresetId = normalizeNullableString(merged.trackerPresetId);
+  merged.savedTrackerPromptId = normalizeNullableString(merged.savedTrackerPromptId);
+  merged.trackerInstructionPrompt = merged.trackerInstructionPrompt || merged.extractionPrompt || DEFAULT_EXTRACTION_PROMPT;
+  merged.extractionPrompt = merged.trackerInstructionPrompt;
+  if (!merged.schemaPresets[merged.activeSchemaPresetKey]) {
+    merged.activeSchemaPresetKey = Object.keys(merged.schemaPresets)[0] ?? "scene";
+    merged.activeSchemaId = merged.activeSchemaPresetKey;
+  }
+  if (!merged.schemaPresets[merged.activeSchemaPresetKey]) {
+    merged.schemaPresets = structuredClone(defaultSchemaPresets);
+    merged.activeSchemaPresetKey = "scene";
+    merged.activeSchemaId = "scene";
+  }
   return merged;
 }
+function settingsForStorage(settings) {
+  const copy = structuredClone(settings);
+  delete copy.schemaPresets;
+  delete copy.activeSchemaId;
+  delete copy.generationMode;
+  delete copy.sequentialPartGeneration;
+  delete copy.includeLastMessages;
+  delete copy.injection;
+  delete copy.extractionPrompt;
+  return copy;
+}
+function sanitizeSchemaPresetMap(input) {
+  if (!isPlainObject(input)) return structuredClone(defaultSchemaPresets);
+  const out = {};
+  for (const [fallbackKey, value] of Object.entries(input)) {
+    if (!isPlainObject(value)) continue;
+    const preset = normalizeSchemaPreset(value, fallbackKey);
+    if (preset) out[preset.key] = preset;
+  }
+  return Object.keys(out).length > 0 ? out : structuredClone(defaultSchemaPresets);
+}
+function normalizeSchemaPreset(input, fallbackKey = "schema") {
+  const value = isPlainObject(input) ? input : {};
+  const key = sanitizeId(readString(value.key) || readString(value.id) || fallbackKey) || sanitizeId(fallbackKey) || "schema";
+  const schema = isPlainObject(value.jsonSchema) ? value.jsonSchema : isPlainObject(value.schema) ? value.schema : DEFAULT_SCHEMA;
+  const template = readString(value.renderTemplate) || readString(value.templateHtml) || DEFAULT_TEMPLATE_HTML;
+  const now = Date.now();
+  return {
+    id: key,
+    key,
+    name: readString(value.name) || key,
+    description: readString(value.description) || void 0,
+    schema,
+    jsonSchema: schema,
+    templateHtml: template,
+    renderTemplate: template,
+    createdAt: sanitizeInteger(value.createdAt, now, 0, Number.MAX_SAFE_INTEGER),
+    updatedAt: sanitizeInteger(value.updatedAt, now, 0, Number.MAX_SAFE_INTEGER)
+  };
+}
 function getSchemaPreset(settings, preferredId) {
-  const id = preferredId && settings.schemaPresets[preferredId] ? preferredId : settings.activeSchemaId;
-  return settings.schemaPresets[id] ?? settings.schemaPresets[Object.keys(settings.schemaPresets)[0]];
+  const key = preferredId && settings.schemaPresets[preferredId] ? preferredId : settings.activeSchemaPresetKey;
+  return settings.schemaPresets[key] ?? settings.schemaPresets[Object.keys(settings.schemaPresets)[0]];
 }
 function getTopLevelSchemaKeys(schema) {
   const properties = schema.properties;
@@ -179,9 +336,7 @@ function getTopLevelSchemaKeys(schema) {
 function buildTopLevelPartSchema(schema, key) {
   const properties = isPlainObject(schema.properties) ? schema.properties : {};
   const property = properties[key];
-  if (!property) {
-    throw new Error(`Unknown schema part: ${key}`);
-  }
+  if (!property) throw new Error(`Unknown schema part: ${key}`);
   return {
     $schema: schema.$schema ?? "http://json-schema.org/draft-07/schema#",
     title: `${String(schema.title ?? "Tracker")}Part`,
@@ -198,9 +353,7 @@ function schemaToExample(schema) {
     case "object": {
       const out = {};
       const properties = isPlainObject(schema.properties) ? schema.properties : {};
-      for (const [key, value] of Object.entries(properties)) {
-        out[key] = schemaToExample(value);
-      }
+      for (const [key, value] of Object.entries(properties)) out[key] = schemaToExample(value);
       return out;
     }
     case "array":
@@ -220,11 +373,51 @@ function renderTrackerTemplate(templateHtml, data) {
   const withoutScripts = stripDangerousHtml(templateHtml);
   return renderScopedTemplate(withoutScripts, data, data);
 }
-function formatTrackerSnapshot(record, header = "Tracker") {
+function snapshotToRecord(snapshot, preset) {
+  const schema = preset?.schema ?? preset?.jsonSchema ?? {};
+  const template = snapshot.renderTemplate || preset?.templateHtml || preset?.renderTemplate || "";
+  return {
+    version: VERSION,
+    snapshotId: snapshot.id,
+    schemaId: snapshot.schemaPresetKey,
+    schemaName: preset?.name ?? snapshot.schemaPresetKey,
+    schema,
+    templateHtml: template,
+    data: snapshot.value,
+    renderedHtml: safeRenderTracker(template, snapshot.value),
+    updatedAt: new Date(snapshot.updatedAt).toISOString(),
+    sourceMessageId: snapshot.messageId,
+    pendingRedactions: snapshot.pendingRedactions
+  };
+}
+function safeRenderTracker(templateHtml, data) {
+  try {
+    return renderTrackerTemplate(templateHtml, data);
+  } catch {
+    return `<pre>${escapeHtml(JSON.stringify(data, null, 2))}</pre>`;
+  }
+}
+function formatTrackerSnapshot(record, header = "Tracker", transform = defaultSnapshotTransformPresets.default_json) {
+  const data = "value" in record ? record.value : "data" in record ? record.data : record;
+  let body = formatSnapshotBody(data, transform.input);
+  if (transform.regexPattern) {
+    try {
+      body = body.replace(new RegExp(transform.regexPattern, transform.regexFlags), transform.replacement);
+    } catch {
+    }
+  }
+  const fenced = transform.wrapInCodeFence ? `\`\`\`${transform.codeFenceLang}
+${body}
+\`\`\`` : body;
   return `${header}
-\`\`\`json
-${JSON.stringify(record.data, null, 2)}
-\`\`\``;
+${fenced}`;
+}
+function formatSnapshotBody(data, input) {
+  if (input === "top_level_lines" && isPlainObject(data)) {
+    return Object.entries(data).map(([key, value]) => `${key}: ${typeof value === "string" ? value : JSON.stringify(value)}`).join("\n");
+  }
+  if (input === "toon") return toToon(data);
+  return JSON.stringify(data, null, 2);
 }
 function safePreview(value, max = 160) {
   const compact = value.replace(/\s+/g, " ").trim();
@@ -243,18 +436,73 @@ function sanitizeId(value) {
 function sanitizeVariableKey(value) {
   return value.trim().replace(/[^a-zA-Z0-9_.-]+/g, "_").slice(0, 80);
 }
+function safeStorageKey(value) {
+  const sanitized = value.replace(/[^a-zA-Z0-9_.-]/g, "_").slice(0, 120);
+  return sanitized || "unknown";
+}
 function chatConfigPath(chatId) {
-  return `chats/${chatId.replace(/[^a-zA-Z0-9_.-]/g, "_")}.json`;
+  return `chats/${safeStorageKey(chatId)}.json`;
+}
+function snapshotsPath(chatId) {
+  return `snapshots/${safeStorageKey(chatId)}.json`;
+}
+function jobsPath(chatId) {
+  return `jobs/${safeStorageKey(chatId)}.json`;
 }
 function isPlainObject(value) {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
+function sanitizeSnapshotTransformPresets(input) {
+  const out = {};
+  for (const [key, raw] of Object.entries(input)) {
+    if (!isPlainObject(raw)) continue;
+    const presetKey = normalizeEnum(raw.key ?? key, ["default_json", "minimal", "toon", "custom"], "custom");
+    out[key] = {
+      key: presetKey,
+      name: readString(raw.name) || key,
+      input: normalizeEnum(raw.input, ["pretty_json", "top_level_lines", "toon"], "pretty_json"),
+      regexPattern: readString(raw.regexPattern),
+      regexFlags: readString(raw.regexFlags),
+      replacement: readString(raw.replacement),
+      codeFenceLang: readString(raw.codeFenceLang),
+      wrapInCodeFence: readBool(raw.wrapInCodeFence, presetKey !== "minimal")
+    };
+  }
+  return out;
+}
+function normalizeAutoMode(value) {
+  if (value === "off") return "none";
+  if (value === "assistant_message") return "responses";
+  if (value === "user_message") return "inputs";
+  return normalizeEnum(value, ["none", "responses", "inputs", "both"], "none");
+}
+function normalizeStructuredOutputMode(value) {
+  if (value === "native_json") return "native_json_schema";
+  if (value === "json") return "json_prompt";
+  return normalizeEnum(value, ["native_json_schema", "json_prompt", "xml_prompt", "toon_prompt"], "json_prompt");
+}
+function normalizeEnum(value, allowed, fallback) {
+  return typeof value === "string" && allowed.includes(value) ? value : fallback;
+}
+function normalizeNullableString(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+function sanitizeStringArray(value) {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => typeof item === "string" && item.trim() ? [item.trim()] : []);
+}
+function readString(value) {
+  return typeof value === "string" ? value : "";
+}
+function readBool(value, fallback) {
+  return typeof value === "boolean" ? value : fallback;
+}
 function assignKnown(target, source, keys) {
   const writable = target;
   for (const key of keys) {
-    if (source[key] !== void 0) {
-      writable[key] = source[key];
-    }
+    if (source[key] !== void 0) writable[key] = source[key];
   }
 }
 function sanitizeInteger(value, fallback, min, max) {
@@ -304,6 +552,17 @@ function resolveTemplatePath(path, scope, rootData) {
     current = current[part];
   }
   return current ?? "";
+}
+function toToon(data, indent = "") {
+  if (Array.isArray(data)) {
+    return data.map((item, index) => `${indent}${index}: ${isPlainObject(item) || Array.isArray(item) ? `
+${toToon(item, `${indent}  `)}` : String(item)}`).join("\n");
+  }
+  if (isPlainObject(data)) {
+    return Object.entries(data).map(([key, value]) => `${indent}${key}: ${isPlainObject(value) || Array.isArray(value) ? `
+${toToon(value, `${indent}  `)}` : String(value)}`).join("\n");
+  }
+  return String(data ?? "");
 }
 
 // src/parser.ts
@@ -424,27 +683,41 @@ function findBalancedEnd(content, start) {
 }
 
 // src/backend.ts
-var settingsCache;
-var busy = false;
-var lastError;
+var settingsCache = /* @__PURE__ */ new Map();
+var activeJobs = /* @__PURE__ */ new Map();
+var lastErrors = /* @__PURE__ */ new Map();
+var diagnostics = /* @__PURE__ */ new Map();
+var chatUserIds = /* @__PURE__ */ new Map();
+var lastFrontendUserId = null;
 var interceptorRegistered = false;
-async function loadSettings() {
-  if (settingsCache) return settingsCache;
-  const saved = await spindle.storage.getJson(SETTINGS_PATH, { fallback: defaultSettings });
-  settingsCache = deepMergeSettings(saved);
-  await spindle.storage.setJson(SETTINGS_PATH, settingsCache, { indent: 2 });
-  return settingsCache;
+function setUserFromFrontend(userId, chatId) {
+  if (userId) lastFrontendUserId = userId;
+  if (userId && chatId) chatUserIds.set(chatId, userId);
 }
-async function saveSettings(settings) {
-  settingsCache = deepMergeSettings(settings);
-  await spindle.storage.setJson(SETTINGS_PATH, settingsCache, { indent: 2 });
-  return settingsCache;
+function resolveUserId(chatId, explicitUserId) {
+  if (explicitUserId) return explicitUserId;
+  if (chatId) {
+    const mapped = chatUserIds.get(chatId);
+    if (mapped) return mapped;
+  }
+  return lastFrontendUserId;
 }
-async function loadChatConfig(chatId) {
-  return spindle.storage.getJson(chatConfigPath(chatId), { fallback: {} });
+function send(userId, payload) {
+  if (!userId) {
+    spindle.log.warn(`Tracktor skipped frontend send without userId: ${JSON.stringify(payload).slice(0, 220)}`);
+    return;
+  }
+  spindle.sendToFrontend(payload, userId);
 }
-async function saveChatConfig(chatId, config) {
-  await spindle.storage.setJson(chatConfigPath(chatId), config, { indent: 2 });
+async function addDiagnostic(userId, message) {
+  const target = userId ?? lastFrontendUserId;
+  spindle.log.warn(message);
+  if (!target) return;
+  const list = [message, ...diagnostics.get(target) ?? []].slice(0, 12);
+  diagnostics.set(target, list);
+  await spindle.userStorage.setJson(DIAGNOSTICS_PATH, { messages: list, updatedAt: Date.now() }, { indent: 2, userId: target }).catch(() => {
+  });
+  send(target, { type: "diagnostic", message });
 }
 function hasPermission(permission) {
   try {
@@ -460,58 +733,144 @@ function permissionWarnings() {
   }
   return warnings;
 }
-async function buildState() {
-  const settings = await loadSettings();
+async function loadSettings(userId) {
+  const cached = settingsCache.get(userId);
+  if (cached) return cached;
+  const [savedSettings, savedSchemas, savedDiagnostics] = await Promise.all([
+    spindle.userStorage.getJson(SETTINGS_PATH, { fallback: defaultSettings, userId }).catch(() => defaultSettings),
+    spindle.userStorage.getJson(SCHEMA_PRESETS_PATH, { fallback: null, userId }).catch(() => null),
+    spindle.userStorage.getJson(DIAGNOSTICS_PATH, { fallback: { messages: [] }, userId }).catch(() => ({ messages: [] }))
+  ]);
+  const schemaPresets = sanitizeSchemaPresetMap(savedSchemas ?? (isPlainObject(savedSettings) ? savedSettings.schemaPresets : null));
+  const settings = deepMergeSettings(savedSettings, schemaPresets);
+  settingsCache.set(userId, settings);
+  if (Array.isArray(savedDiagnostics?.messages)) {
+    diagnostics.set(userId, savedDiagnostics.messages.filter((item) => typeof item === "string").slice(0, 12));
+  }
+  await saveSettings(settings, userId);
+  return settings;
+}
+async function saveSettings(settings, userId) {
+  const merged = deepMergeSettings(settings, settings.schemaPresets);
+  settingsCache.set(userId, merged);
+  await Promise.all([
+    spindle.userStorage.setJson(SETTINGS_PATH, settingsForStorage(merged), { indent: 2, userId }),
+    spindle.userStorage.setJson(SCHEMA_PRESETS_PATH, merged.schemaPresets, { indent: 2, userId })
+  ]);
+  return merged;
+}
+async function loadChatConfig(userId, chatId) {
+  return spindle.userStorage.getJson(chatConfigPath(chatId), { fallback: {}, userId });
+}
+async function saveChatConfig(userId, chatId, config) {
+  await spindle.userStorage.setJson(chatConfigPath(chatId), config, { indent: 2, userId });
+}
+async function loadSnapshots(userId, chatId) {
+  const file = await spindle.userStorage.getJson(snapshotsPath(chatId), {
+    fallback: { chatId, snapshots: [] },
+    userId
+  }).catch(() => ({ chatId, snapshots: [] }));
+  const snapshots = Array.isArray(file?.snapshots) ? file.snapshots : [];
+  return snapshots.flatMap((snapshot) => normalizeSnapshot(snapshot, chatId));
+}
+async function saveSnapshots(userId, chatId, snapshots) {
+  snapshots.sort((a, b) => a.updatedAt - b.updatedAt);
+  await spindle.userStorage.setJson(snapshotsPath(chatId), { chatId, snapshots }, { indent: 2, userId });
+}
+function normalizeSnapshot(input, fallbackChatId) {
+  if (!isPlainObject(input)) return [];
+  if (!isPlainObject(input.value) || typeof input.messageId !== "string") return [];
+  const now = Date.now();
+  return [{
+    id: typeof input.id === "string" ? input.id : makeId("snapshot"),
+    chatId: typeof input.chatId === "string" ? input.chatId : fallbackChatId,
+    messageId: input.messageId,
+    schemaPresetKey: typeof input.schemaPresetKey === "string" ? input.schemaPresetKey : typeof input.schemaId === "string" ? input.schemaId : "scene",
+    value: input.value,
+    renderTemplate: typeof input.renderTemplate === "string" ? input.renderTemplate : typeof input.templateHtml === "string" ? input.templateHtml : "",
+    partsOrder: Array.isArray(input.partsOrder) ? input.partsOrder.filter((part) => typeof part === "string") : [],
+    partsMeta: isPlainObject(input.partsMeta) ? input.partsMeta : {},
+    pendingRedactions: isPlainObject(input.pendingRedactions) ? input.pendingRedactions : {},
+    createdAt: typeof input.createdAt === "number" ? input.createdAt : now,
+    updatedAt: typeof input.updatedAt === "number" ? input.updatedAt : now
+  }];
+}
+async function upsertSnapshot(userId, snapshot) {
+  const snapshots = await loadSnapshots(userId, snapshot.chatId);
+  const index = snapshots.findIndex((item) => item.messageId === snapshot.messageId);
+  if (index >= 0) snapshots[index] = snapshot;
+  else snapshots.push(snapshot);
+  await saveSnapshots(userId, snapshot.chatId, snapshots);
+}
+async function deleteSnapshot(userId, chatId, messageId) {
+  const snapshots = await loadSnapshots(userId, chatId);
+  await saveSnapshots(userId, chatId, snapshots.filter((item) => item.messageId !== messageId));
+}
+async function buildState(userId, chatId) {
+  const settings = await loadSettings(userId);
+  const userJobs = [...activeJobs.values()].filter((job) => job.userId === userId).map((job) => job.state);
   return {
     settings,
-    activeChat: await getActiveChatState(settings),
+    activeChat: await getActiveChatState(settings, userId, chatId),
     permissionWarnings: permissionWarnings(),
-    busy,
-    ...lastError ? { lastError } : {}
+    busy: userJobs.length > 0,
+    jobs: userJobs,
+    diagnostics: diagnostics.get(userId) ?? [],
+    ...lastErrors.get(userId) ? { lastError: lastErrors.get(userId) } : {}
   };
 }
-async function sendState(userId) {
-  spindle.sendToFrontend({ type: "state", state: await buildState() }, userId);
+async function sendState(userId, chatId) {
+  send(userId, { type: "state", state: await buildState(userId, chatId) });
 }
-async function getActiveChatState(settings) {
-  if (!hasPermission("chats") || !hasPermission("chat_mutation")) {
-    return null;
-  }
-  const chat = await spindle.chats.getActive();
-  if (!chat) return null;
-  const messages = await spindle.chat.getMessages(chat.id);
+async function getActiveChatState(settings, userId, chatId) {
+  if (!hasPermission("chats") || !hasPermission("chat_mutation")) return null;
+  const chat = chatId ? await spindle.chats.get(chatId, userId).catch(() => null) : await spindle.chats.getActive(userId).catch(() => null);
+  if (!chat?.id) return null;
+  chatUserIds.set(chat.id, userId);
+  const messages = await spindle.chat.getMessages(chat.id, userId);
+  const snapshots = await loadSnapshots(userId, chat.id);
   return {
     id: chat.id,
     name: chat.name ?? "Active chat",
     messageCount: messages.length,
-    trackers: collectTrackerSummaries(chat.id, messages, settings)
+    trackers: collectTrackerSummaries(chat.id, messages, snapshots, settings)
   };
 }
-function collectTrackerSummaries(chatId, messages, settings) {
+function collectTrackerSummaries(chatId, messages, snapshots, settings) {
+  const byMessage = new Map(snapshots.map((snapshot) => [snapshot.messageId, snapshot]));
   return messages.flatMap((message) => {
-    const tracker = readTrackerRecord(message);
-    if (!tracker) return [];
-    const preset = settings.schemaPresets[tracker.schemaId];
-    const renderedHtml = safeRenderTracker(tracker.templateHtml || preset?.templateHtml || "", tracker.data);
+    const snapshot = byMessage.get(message.id) ?? legacySnapshotFromMessage(chatId, message);
+    if (!snapshot) return [];
+    const preset = settings.schemaPresets[snapshot.schemaPresetKey];
     return [{
       chatId,
       messageId: message.id,
       role: message.role,
       messagePreview: safePreview(message.content || ""),
-      tracker: {
-        ...tracker,
-        renderedHtml
-      }
+      snapshot,
+      tracker: snapshotToRecord(snapshot, preset)
     }];
   });
 }
-function readTrackerRecord(message) {
-  const metadata = message.metadata;
-  const candidate = metadata?.[METADATA_KEY];
-  if (!candidate || typeof candidate !== "object") return void 0;
+function legacySnapshotFromMessage(chatId, message) {
+  const candidate = message.metadata?.[METADATA_KEY];
+  if (!isPlainObject(candidate) || !("data" in candidate) || !candidate.data || !candidate.sourceMessageId) return void 0;
   const record = candidate;
-  if (!record.data || !record.sourceMessageId) return void 0;
-  return record;
+  if (!isPlainObject(record.data)) return void 0;
+  const updatedAt = Date.parse(record.updatedAt || "") || Date.now();
+  return {
+    id: record.snapshotId ?? makeSnapshotId(chatId, message.id),
+    chatId,
+    messageId: message.id,
+    schemaPresetKey: record.schemaId,
+    value: record.data,
+    renderTemplate: record.templateHtml,
+    partsOrder: getTopLevelSchemaKeys(record.schema),
+    partsMeta: {},
+    pendingRedactions: record.pendingRedactions ?? {},
+    createdAt: updatedAt,
+    updatedAt
+  };
 }
 function resolveTargetMessage(messages, requestedMessageId) {
   if (requestedMessageId) {
@@ -519,42 +878,56 @@ function resolveTargetMessage(messages, requestedMessageId) {
     if (!found) throw new Error(`Message not found: ${requestedMessageId}`);
     return found;
   }
-  const preferred = [...messages].reverse().find((message) => message.role === "assistant") ?? messages[messages.length - 1];
-  if (!preferred) throw new Error("No messages are available in the active chat.");
-  return preferred;
+  const latest = messages[messages.length - 1];
+  if (!latest) throw new Error("No messages are available in the active chat.");
+  return latest;
 }
 async function generateTrackerForMessage(options) {
   if (!hasPermission("generation")) throw new Error("Generation permission is not granted.");
+  if (!hasPermission("chats")) throw new Error("Chats permission is not granted.");
   if (!hasPermission("chat_mutation")) throw new Error("Chat mutation permission is not granted.");
-  const settings = await loadSettings();
-  const chat = options.chatId ? { id: options.chatId } : await spindle.chats.getActive();
+  const settings = await loadSettings(options.userId);
+  const chat = options.chatId ? await spindle.chats.get(options.chatId, options.userId).catch(() => ({ id: options.chatId })) : await spindle.chats.getActive(options.userId);
   if (!chat?.id) throw new Error("No active chat is open.");
-  const messages = await spindle.chat.getMessages(chat.id);
+  chatUserIds.set(chat.id, options.userId);
+  const messages = await spindle.chat.getMessages(chat.id, options.userId);
   const target = resolveTargetMessage(messages, options.messageId);
   const targetIndex = messages.findIndex((message) => message.id === target.id);
-  const chatConfig = await loadChatConfig(chat.id);
-  const preset = getSchemaPreset(settings, chatConfig.schemaId);
-  const sequential = options.sequential ?? settings.sequentialPartGeneration;
-  const data = sequential ? await generateTrackerSequential(messages, targetIndex, settings, preset, options.userId) : await generateTrackerFull(messages, targetIndex, settings, preset, options.userId);
-  const record = makeTrackerRecord(target.id, preset, data);
-  await persistTrackerRecord(chat.id, target, record, settings);
-  return record;
+  if (settings.skipFirstMessages > 0 && targetIndex < settings.skipFirstMessages) {
+    throw new Error(`Tracker generation is skipped for the first ${settings.skipFirstMessages} messages.`);
+  }
+  const chatConfig = await loadChatConfig(options.userId, chat.id);
+  const preset = getSchemaPreset(settings, chatConfig.schemaPresetKey ?? chatConfig.schemaId);
+  const snapshots = await loadSnapshots(options.userId, chat.id);
+  const priorSnapshots = collectPriorSnapshots(messages, snapshots, targetIndex, settings.includeLastTrackers);
+  const sequential = options.sequential ?? settings.sequentialGeneration;
+  const data = sequential ? await generateTrackerSequential(messages, targetIndex, settings, preset, priorSnapshots, options.userId, options.job) : await generateTrackerFull(messages, targetIndex, settings, preset, priorSnapshots, options.userId, options.job?.controller.signal);
+  assertSchemaRequired(data, preset.schema);
+  const snapshot = makeTrackerSnapshot(chat.id, target.id, preset, data, snapshots.find((item) => item.messageId === target.id));
+  renderTrackerTemplate(snapshot.renderTemplate, snapshot.value);
+  await persistTrackerSnapshot(options.userId, target, snapshot, settings);
+  return snapshot;
 }
-async function generateTrackerFull(messages, targetIndex, settings, preset, userId) {
-  const prompt = buildTrackerPrompt(messages, targetIndex, settings, preset);
-  return requestJsonForSchema(prompt, preset.schema, "tracktor_tracker", settings, userId);
+async function generateTrackerFull(messages, targetIndex, settings, preset, priorSnapshots, userId, signal) {
+  const prompt = buildTrackerPrompt(messages, targetIndex, settings, preset, priorSnapshots);
+  const data = await requestJsonForSchema(prompt, preset.schema, "tracktor_tracker", settings, userId, signal);
+  if (!isPlainObject(data)) throw new Error("Tracker response was not a JSON object.");
+  return data;
 }
-async function generateTrackerSequential(messages, targetIndex, settings, preset, userId) {
+async function generateTrackerSequential(messages, targetIndex, settings, preset, priorSnapshots, userId, job) {
   const keys = getTopLevelSchemaKeys(preset.schema);
   if (keys.length === 0) throw new Error("The active tracker schema has no top-level properties.");
   const tracker = {};
-  for (const key of keys) {
+  for (let index = 0; index < keys.length; index += 1) {
+    if (job?.controller.signal.aborted) throw new DOMException("Tracker generation cancelled.", "AbortError");
+    const key = keys[index];
+    updateJob(job, { currentPart: index + 1, totalParts: keys.length, label: `Generating ${key}` });
     const partSchema = buildTopLevelPartSchema(preset.schema, key);
-    const prompt = buildTrackerPrompt(messages, targetIndex, settings, preset, {
+    const prompt = buildTrackerPrompt(messages, targetIndex, settings, preset, priorSnapshots, {
       partKey: key,
       trackerSoFar: tracker
     });
-    const part = await requestJsonForSchema(prompt, partSchema, `tracktor_${key}`, settings, userId);
+    const part = await requestJsonForSchema(prompt, partSchema, `tracktor_${key}`, settings, userId, job?.controller.signal);
     if (!part || typeof part !== "object" || !(key in part)) {
       throw new Error(`Part response did not include "${key}".`);
     }
@@ -562,12 +935,12 @@ async function generateTrackerSequential(messages, targetIndex, settings, preset
   }
   return tracker;
 }
-async function requestJsonForSchema(promptMessages, schema, schemaName, settings, userId) {
+async function requestJsonForSchema(promptMessages, schema, schemaName, settings, userId, signal) {
   const parameters = {
     max_tokens: settings.maxResponseTokens
   };
   const messages = [...promptMessages];
-  if (settings.generationMode === "native_json") {
+  if (settings.structuredOutputMode === "native_json_schema") {
     parameters.response_format = {
       type: "json_schema",
       json_schema: {
@@ -579,18 +952,18 @@ async function requestJsonForSchema(promptMessages, schema, schemaName, settings
   } else {
     messages.push({
       role: "user",
-      content: buildJsonFormatInstruction(schema)
+      content: buildFormatInstruction(settings, schema)
     });
   }
   const result = await spindle.generate.quiet({
     type: "quiet",
     messages,
     parameters,
-    ...userId ? { userId } : {}
+    ...settings.trackerConnectionId ? { connection_id: settings.trackerConnectionId } : {},
+    userId,
+    signal
   });
-  if (result?.content && typeof result.content === "object") {
-    return result.content;
-  }
+  if (result?.content && typeof result.content === "object") return result.content;
   const content = typeof result?.content === "string" ? result.content : JSON.stringify(result?.content ?? "");
   const parsed = parseJsonTrackerResponse(content);
   if (settings.debugLogging && parsed.repairSteps.length > 0) {
@@ -598,10 +971,10 @@ async function requestJsonForSchema(promptMessages, schema, schemaName, settings
   }
   return parsed.data;
 }
-function buildTrackerPrompt(messages, targetIndex, settings, preset, options = {}) {
-  const start = Math.max(0, targetIndex - settings.includeLastMessages + 1);
+function buildTrackerPrompt(messages, targetIndex, settings, preset, priorSnapshots, options = {}) {
+  const limit = settings.trackerContextMessageLimit;
+  const start = limit <= 0 ? 0 : Math.max(0, targetIndex - limit + 1);
   const recent = messages.slice(start, targetIndex + 1);
-  const priorTrackers = collectPriorTrackers(messages.slice(0, targetIndex + 1), settings.includeLastTrackers);
   const target = messages[targetIndex];
   const partLine = options.partKey ? `Generate only the top-level "${options.partKey}" property and return it wrapped in a JSON object.` : "Generate the complete tracker object.";
   const prompt = [
@@ -609,19 +982,19 @@ function buildTrackerPrompt(messages, targetIndex, settings, preset, options = {
     {
       role: "user",
       content: [
-        settings.extractionPrompt,
+        settings.trackerInstructionPrompt,
         partLine,
         `Active schema preset: ${preset.name}`,
         `Target message id: ${target.id}`
       ].join("\n")
     }
   ];
-  if (priorTrackers.length > 0) {
+  if (priorSnapshots.length > 0) {
     prompt.push({
       role: "user",
       content: `Previous tracker snapshots for continuity:
 
-${priorTrackers.map((record) => formatTrackerSnapshot(record, record.schemaName)).join("\n\n")}`
+${priorSnapshots.map((snapshot) => formatTrackerSnapshot(snapshot, snapshot.schemaPresetKey)).join("\n\n")}`
     });
   }
   if (options.trackerSoFar && Object.keys(options.trackerSoFar).length > 0) {
@@ -637,200 +1010,341 @@ ${JSON.stringify(options.trackerSoFar, null, 2)}
     role: "user",
     content: `Recent conversation up to the target message:
 
-${formatConversation(recent)}`
+${formatConversation(recent, settings)}`
   });
   return prompt;
 }
-function buildJsonFormatInstruction(schema) {
-  return [
-    "Return only one valid JSON object. Do not include markdown fences, commentary, or prose outside JSON.",
-    "The object must conform to this JSON Schema:",
-    "```json",
-    JSON.stringify(schema, null, 2),
-    "```",
-    "Example shape:",
-    "```json",
-    JSON.stringify(schemaToExample(schema), null, 2),
-    "```"
-  ].join("\n");
+function buildFormatInstruction(settings, schema) {
+  const template = settings.structuredOutputMode === "xml_prompt" ? settings.xmlPromptTemplate : settings.structuredOutputMode === "toon_prompt" ? settings.toonPromptTemplate : settings.jsonPromptTemplate;
+  return template.replaceAll("{{schema}}", JSON.stringify(schema, null, 2)).replaceAll("{{example_response}}", JSON.stringify(schemaToExample(schema), null, 2)).replaceAll("{{format_instructions}}", "Return only valid JSON that matches the schema.").replaceAll("{{current_tracker}}", "").replaceAll("{{target_part}}", "");
 }
-function formatConversation(messages) {
-  return messages.map((message) => `${message.role.toUpperCase()} (${message.id}):
-${message.content.trim()}`).join("\n\n");
+function formatConversation(messages, settings) {
+  if (settings.trackerConversationRoleMode === "plain_transcript") {
+    return messages.map((message) => `${message.name || message.role}: ${message.content.trim()}`).join("\n\n");
+  }
+  return messages.map((message) => {
+    const role = settings.trackerConversationRoleMode === "all_assistant" ? "assistant" : message.role;
+    return `${role.toUpperCase()} (${message.id}):
+${message.content.trim()}`;
+  }).join("\n\n");
 }
-function collectPriorTrackers(messages, limit) {
+function collectPriorSnapshots(messages, snapshots, targetIndex, limit) {
   if (limit <= 0) return [];
-  const found = [];
-  for (let i = messages.length - 1; i >= 0 && found.length < limit; i -= 1) {
-    const record = readTrackerRecord(messages[i]);
-    if (record) found.unshift(record);
-  }
-  return found;
+  const messageIndex = new Map(messages.map((message, index) => [message.id, index]));
+  return snapshots.filter((snapshot) => {
+    const index = messageIndex.get(snapshot.messageId);
+    return typeof index === "number" && index <= targetIndex;
+  }).sort((a, b) => (messageIndex.get(a.messageId) ?? 0) - (messageIndex.get(b.messageId) ?? 0)).slice(-limit);
 }
-function makeTrackerRecord(messageId, preset, data) {
+function makeTrackerSnapshot(chatId, messageId, preset, data, existing) {
+  const now = Date.now();
   return {
-    version: VERSION,
-    schemaId: preset.id,
-    schemaName: preset.name,
-    schema: preset.schema,
-    templateHtml: preset.templateHtml,
-    data,
-    renderedHtml: safeRenderTracker(preset.templateHtml, data),
-    updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
-    sourceMessageId: messageId
+    id: existing?.id ?? makeSnapshotId(chatId, messageId),
+    chatId,
+    messageId,
+    schemaPresetKey: preset.key,
+    value: data,
+    renderTemplate: preset.renderTemplate,
+    partsOrder: getTopLevelSchemaKeys(preset.schema),
+    partsMeta: existing?.partsMeta ?? {},
+    pendingRedactions: existing?.pendingRedactions ?? {},
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now
   };
 }
-function safeRenderTracker(templateHtml, data) {
-  try {
-    return renderTrackerTemplate(templateHtml, data);
-  } catch (error) {
-    return `<pre>${escapeForPre(JSON.stringify(data, null, 2))}</pre>`;
+async function persistTrackerSnapshot(userId, message, snapshot, settings) {
+  await upsertSnapshot(userId, snapshot);
+  if (hasPermission("chat_mutation")) {
+    const nextMetadata = {
+      ...message.metadata ?? {},
+      [METADATA_KEY]: { snapshotId: snapshot.id, updatedAt: snapshot.updatedAt }
+    };
+    await spindle.chat.updateMessage(snapshot.chatId, message.id, { metadata: nextMetadata }, userId).catch((error) => {
+      void addDiagnostic(userId, `Tracktor could not mirror snapshot metadata: ${error instanceof Error ? error.message : String(error)}`);
+    });
   }
-}
-function escapeForPre(value) {
-  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-}
-async function persistTrackerRecord(chatId, message, record, settings) {
-  const nextMetadata = {
-    ...message.metadata ?? {},
-    [METADATA_KEY]: record
-  };
-  await spindle.chat.updateMessage(chatId, message.id, { metadata: nextMetadata });
   if (settings.chatVariableExport.enabled) {
-    await spindle.variables.chat.set(chatId, settings.chatVariableExport.key, JSON.stringify(record.data));
+    await spindle.variables?.chat?.set?.(snapshot.chatId, settings.chatVariableExport.key, JSON.stringify(snapshot.value)).catch?.(() => {
+    });
   }
 }
-async function updateTrackerData(chatId, messageId, data) {
-  const settings = await loadSettings();
-  const messages = await spindle.chat.getMessages(chatId);
+async function updateTrackerData(userId, chatId, messageId, data) {
+  if (!isPlainObject(data)) throw new Error("Tracker JSON must be an object.");
+  const settings = await loadSettings(userId);
+  const messages = await spindle.chat.getMessages(chatId, userId);
   const message = messages.find((item) => item.id === messageId);
   if (!message) throw new Error(`Message not found: ${messageId}`);
-  const current = readTrackerRecord(message);
-  const preset = getSchemaPreset(settings, current?.schemaId);
-  const record = makeTrackerRecord(messageId, current ? {
-    id: current.schemaId,
-    name: current.schemaName,
-    schema: current.schema,
-    templateHtml: current.templateHtml
-  } : preset, data);
-  await persistTrackerRecord(chatId, message, record, settings);
+  const snapshots = await loadSnapshots(userId, chatId);
+  const current = snapshots.find((item) => item.messageId === messageId) ?? legacySnapshotFromMessage(chatId, message);
+  const preset = getSchemaPreset(settings, current?.schemaPresetKey);
+  const snapshot = makeTrackerSnapshot(chatId, messageId, preset, data, current);
+  renderTrackerTemplate(snapshot.renderTemplate, snapshot.value);
+  await persistTrackerSnapshot(userId, message, snapshot, settings);
 }
-async function deleteTracker(chatId, messageId) {
-  const messages = await spindle.chat.getMessages(chatId);
+async function deleteTracker(userId, chatId, messageId) {
+  const messages = await spindle.chat.getMessages(chatId, userId);
   const message = messages.find((item) => item.id === messageId);
-  if (!message) throw new Error(`Message not found: ${messageId}`);
-  const nextMetadata = { ...message.metadata ?? {} };
-  delete nextMetadata[METADATA_KEY];
-  await spindle.chat.updateMessage(chatId, messageId, { metadata: nextMetadata });
-}
-async function setBusy(work, userId) {
-  busy = true;
-  lastError = void 0;
-  await sendState(userId);
-  try {
-    return await work();
-  } catch (error) {
-    lastError = error instanceof Error ? error.message : String(error);
-    throw error;
-  } finally {
-    busy = false;
-    await sendState(userId);
+  await deleteSnapshot(userId, chatId, messageId);
+  if (message && hasPermission("chat_mutation")) {
+    const nextMetadata = { ...message.metadata ?? {} };
+    delete nextMetadata[METADATA_KEY];
+    await spindle.chat.updateMessage(chatId, messageId, { metadata: nextMetadata }, userId);
   }
+}
+async function regeneratePart(userId, chatId, messageId, partKey) {
+  const { settings, messages, targetIndex, preset, snapshot, message } = await loadSnapshotGenerationContext(userId, chatId, messageId);
+  const schema = buildTopLevelPartSchema(preset.schema, partKey);
+  const prompt = buildTrackerPrompt(messages, targetIndex, settings, preset, [], {
+    partKey,
+    trackerSoFar: omitKey(snapshot.value, partKey)
+  });
+  const part = await requestJsonForSchema(prompt, schema, `tracktor_${partKey}`, settings, userId);
+  if (!isPlainObject(part) || !(partKey in part)) throw new Error(`Part response did not include "${partKey}".`);
+  const next = { ...snapshot.value, [partKey]: part[partKey] };
+  const updated = makeTrackerSnapshot(chatId, messageId, preset, next, snapshot);
+  await persistTrackerSnapshot(userId, message, updated, settings);
+}
+async function loadSnapshotGenerationContext(userId, chatId, messageId) {
+  const settings = await loadSettings(userId);
+  const messages = await spindle.chat.getMessages(chatId, userId);
+  const message = messages.find((item) => item.id === messageId);
+  if (!message) throw new Error(`Message not found: ${messageId}`);
+  const snapshots = await loadSnapshots(userId, chatId);
+  const snapshot = snapshots.find((item) => item.messageId === messageId) ?? legacySnapshotFromMessage(chatId, message);
+  if (!snapshot) throw new Error("No tracker snapshot is saved for this message.");
+  const preset = getSchemaPreset(settings, snapshot.schemaPresetKey);
+  const targetIndex = messages.findIndex((item) => item.id === messageId);
+  return { settings, messages, message, snapshot, preset, targetIndex };
+}
+function omitKey(value, key) {
+  const next = { ...value };
+  delete next[key];
+  return next;
+}
+function assertSchemaRequired(data, schema) {
+  if (!isPlainObject(data)) throw new Error("Tracker response was not a JSON object.");
+  const required = Array.isArray(schema.required) ? schema.required : [];
+  const missing = required.filter((key) => typeof key === "string" && !(key in data));
+  if (missing.length > 0) throw new Error(`Tracker response is missing required fields: ${missing.join(", ")}`);
+}
+function makeId(prefix) {
+  const random = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  return `${prefix}_${random}`;
+}
+function makeSnapshotId(chatId, messageId) {
+  return `snap_${hashText(`${chatId}:${messageId}`)}`;
+}
+function hashText(value) {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+function createJob(userId, chatId, messageId, label) {
+  const job = {
+    userId,
+    controller: new AbortController(),
+    state: {
+      id: makeId("job"),
+      chatId,
+      messageId,
+      label,
+      status: "running"
+    }
+  };
+  activeJobs.set(job.state.id, job);
+  send(userId, { type: "job_started", job: job.state });
+  void saveJobs(userId, chatId);
+  return job;
+}
+function updateJob(job, patch) {
+  if (!job) return;
+  job.state = { ...job.state, ...patch };
+  activeJobs.set(job.state.id, job);
+  send(job.userId, { type: "job_progress", job: job.state });
+  void saveJobs(job.userId, job.state.chatId);
+}
+function finishJob(job, status, error) {
+  job.state = { ...job.state, status, ...error ? { error } : {} };
+  send(job.userId, status === "complete" ? { type: "job_finished", job: job.state } : { type: "job_failed", job: job.state });
+  activeJobs.delete(job.state.id);
+  void saveJobs(job.userId, job.state.chatId);
+}
+async function saveJobs(userId, chatId) {
+  const jobs = [...activeJobs.values()].filter((job) => job.userId === userId && job.state.chatId === chatId).map((job) => job.state);
+  await spindle.userStorage.setJson(jobsPath(chatId), { chatId, jobs, updatedAt: Date.now() }, { indent: 2, userId }).catch(() => {
+  });
 }
 function parsePayloadJson(value) {
   if (typeof value !== "string") return value;
   return parseJsonTrackerResponse(value).data;
 }
-spindle.onFrontendMessage(async (payload, userId) => {
+async function runJob(userId, chatId, messageId, label, work) {
+  const resolvedChatId = chatId || (await spindle.chats.getActive(userId))?.id;
+  if (!resolvedChatId) throw new Error("No active chat is open.");
+  const job = createJob(userId, resolvedChatId, messageId, label);
+  lastErrors.delete(userId);
+  await sendState(userId, resolvedChatId);
+  try {
+    await work(job);
+    finishJob(job, "complete");
+    await sendState(userId, resolvedChatId);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    lastErrors.set(userId, message);
+    finishJob(job, "failed", message);
+    spindle.toast.error(message, { title: "Tracktor", duration: 1e4 });
+    await sendState(userId, resolvedChatId);
+  }
+}
+spindle.onFrontendMessage(async (payload, rawUserId) => {
+  const chatId = typeof payload?.chatId === "string" ? payload.chatId : null;
+  setUserFromFrontend(rawUserId, chatId);
+  if (!rawUserId) {
+    await addDiagnostic(null, "Tracktor received a frontend message without a Lumiverse userId.");
+    return;
+  }
+  const userId = rawUserId;
   try {
     switch (payload?.type) {
+      case "ready":
+      case "refresh_state":
       case "get_state":
-        await sendState(userId);
+        await sendState(userId, chatId);
         break;
       case "save_settings": {
-        await saveSettings(payload.settings);
+        await saveSettings(payload.settings, userId);
         spindle.toast.success("Settings saved.", { title: "Tracktor" });
-        await sendState(userId);
+        await sendState(userId, chatId);
         break;
       }
       case "set_chat_schema": {
         if (!payload.chatId || !payload.schemaId) throw new Error("chatId and schemaId are required.");
-        await saveChatConfig(payload.chatId, { schemaId: payload.schemaId });
+        await saveChatConfig(userId, payload.chatId, { schemaPresetKey: payload.schemaId, schemaId: payload.schemaId });
         spindle.toast.success("Chat schema updated.", { title: "Tracktor" });
-        await sendState(userId);
+        await sendState(userId, payload.chatId);
         break;
       }
       case "generate_tracker":
-        await setBusy(async () => {
+      case "regenerate_tracker":
+        await runJob(userId, payload.chatId, payload.messageId, "Generating tracker", async (job) => {
           await generateTrackerForMessage({
             chatId: payload.chatId,
             messageId: payload.messageId,
             sequential: payload.sequential,
-            userId
+            userId,
+            job
           });
           spindle.toast.success("Tracker generated.", { title: "Tracktor" });
-        }, userId);
+        });
         break;
+      case "regenerate_part":
+        if (!payload.chatId || !payload.messageId || !payload.partKey) throw new Error("chatId, messageId, and partKey are required.");
+        await runJob(userId, payload.chatId, payload.messageId, `Regenerating ${payload.partKey}`, async () => {
+          await regeneratePart(userId, payload.chatId, payload.messageId, payload.partKey);
+          spindle.toast.success("Tracker section regenerated.", { title: "Tracktor" });
+        });
+        break;
+      case "edit_snapshot":
       case "update_tracker":
-        await setBusy(async () => {
-          await updateTrackerData(payload.chatId, payload.messageId, parsePayloadJson(payload.data));
+        await runJob(userId, payload.chatId, payload.messageId, "Saving tracker JSON", async () => {
+          await updateTrackerData(userId, payload.chatId, payload.messageId, parsePayloadJson(payload.data));
           spindle.toast.success("Tracker updated.", { title: "Tracktor" });
-        }, userId);
+        });
         break;
+      case "delete_snapshot":
       case "delete_tracker":
-        await setBusy(async () => {
-          await deleteTracker(payload.chatId, payload.messageId);
+        await runJob(userId, payload.chatId, payload.messageId, "Deleting tracker", async () => {
+          await deleteTracker(userId, payload.chatId, payload.messageId);
           spindle.toast.success("Tracker deleted.", { title: "Tracktor" });
-        }, userId);
+        });
         break;
+      case "cancel_job": {
+        const job = typeof payload.jobId === "string" ? activeJobs.get(payload.jobId) : void 0;
+        if (job && job.userId === userId) job.controller.abort();
+        break;
+      }
+      case "toggle_injection": {
+        const settings = await loadSettings(userId);
+        settings.injectTrackerSnapshots = !settings.injectTrackerSnapshots;
+        await saveSettings(settings, userId);
+        await sendState(userId, chatId);
+        break;
+      }
       default:
-        spindle.log.warn(`Unknown frontend message: ${JSON.stringify(payload)}`);
+        await addDiagnostic(userId, `Unknown frontend message: ${JSON.stringify(payload)}`);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    lastError = message;
+    lastErrors.set(userId, message);
     spindle.toast.error(message, { title: "Tracktor", duration: 1e4 });
-    await sendState(userId);
+    await addDiagnostic(userId, message);
+    await sendState(userId, chatId);
   }
 });
-spindle.on("CHARACTER_MESSAGE_RENDERED", async (payload) => {
-  const settings = await loadSettings();
-  if (settings.autoMode !== "assistant_message") return;
-  try {
-    await generateTrackerForMessage({ chatId: payload.chatId, messageId: payload.messageId });
-    await sendState();
-  } catch (error) {
-    spindle.log.warn(`Auto tracker generation failed: ${error instanceof Error ? error.message : String(error)}`);
+function shouldAutoGenerate(settings, kind) {
+  return settings.autoMode === kind || settings.autoMode === "both";
+}
+async function handleAutoGeneration(payload, eventUserId, kind) {
+  const chatId = typeof payload?.chatId === "string" ? payload.chatId : null;
+  const messageId = typeof payload?.messageId === "string" ? payload.messageId : typeof payload?.message?.id === "string" ? payload.message.id : void 0;
+  const userId = resolveUserId(chatId, eventUserId);
+  if (!chatId || !messageId || !userId) {
+    await addDiagnostic(userId, `Tracktor skipped ${kind} auto-generation because chat/user/message context was incomplete.`);
+    return;
   }
+  setUserFromFrontend(userId, chatId);
+  const settings = await loadSettings(userId);
+  if (!shouldAutoGenerate(settings, kind)) return;
+  await runJob(userId, chatId, messageId, `Auto tracker (${kind})`, async (job) => {
+    await generateTrackerForMessage({ userId, chatId, messageId, job });
+  });
+}
+spindle.on("CHARACTER_MESSAGE_RENDERED", (payload, userId) => {
+  void handleAutoGeneration(payload, userId, "responses");
 });
-spindle.on("USER_MESSAGE_RENDERED", async (payload) => {
-  const settings = await loadSettings();
-  if (settings.autoMode !== "user_message") return;
-  try {
-    await generateTrackerForMessage({ chatId: payload.chatId, messageId: payload.messageId });
-    await sendState();
-  } catch (error) {
-    spindle.log.warn(`Auto tracker generation failed: ${error instanceof Error ? error.message : String(error)}`);
-  }
+spindle.on("USER_MESSAGE_RENDERED", (payload, userId) => {
+  void handleAutoGeneration(payload, userId, "inputs");
 });
-spindle.on("CHAT_CHANGED", async () => {
-  await sendState();
+spindle.on("CHAT_CHANGED", (payload, userId) => {
+  const chatId = typeof payload?.chatId === "string" ? payload.chatId : null;
+  const targetUserId = resolveUserId(chatId, userId);
+  if (!targetUserId) return;
+  setUserFromFrontend(targetUserId, chatId);
+  void sendState(targetUserId, chatId);
+});
+spindle.on("CHAT_SWITCHED", (payload, userId) => {
+  const chatId = typeof payload?.chatId === "string" ? payload.chatId : null;
+  const targetUserId = resolveUserId(chatId, userId);
+  if (!targetUserId) return;
+  setUserFromFrontend(targetUserId, chatId);
+  void sendState(targetUserId, chatId);
+});
+spindle.on("GENERATION_STARTED", (payload, userId) => {
+  const chatId = typeof payload?.chatId === "string" ? payload.chatId : null;
+  if (chatId && userId) setUserFromFrontend(userId, chatId);
 });
 function tryRegisterInterceptor() {
   if (interceptorRegistered || !hasPermission("interceptor")) return;
   spindle.registerInterceptor(async (messages, context) => {
-    const settings = await loadSettings();
-    if (!settings.injection.enabled || settings.injection.includeLastTrackers <= 0) {
+    const chatId = typeof context?.chatId === "string" ? context.chatId : null;
+    if (!chatId || context?.generationType === "quiet") return messages;
+    const userId = resolveUserId(chatId, typeof context?.userId === "string" ? context.userId : null);
+    if (!userId) {
+      await addDiagnostic(null, "Tracktor skipped prompt injection because no userId was known for the chat.");
       return messages;
     }
-    const chatId = context?.chatId;
-    if (!chatId || !hasPermission("chat_mutation")) return messages;
-    const chatMessages = await spindle.chat.getMessages(chatId);
-    const trackers = collectPriorTrackers(chatMessages, settings.injection.includeLastTrackers);
-    if (trackers.length === 0) return messages;
-    const injected = trackers.map((tracker) => ({
-      role: settings.injection.role,
-      content: formatTrackerSnapshot(tracker, settings.injection.header || tracker.schemaName)
+    const settings = await loadSettings(userId);
+    if (!settings.injectTrackerSnapshots || settings.trackerSnapshotCount <= 0) return messages;
+    const snapshots = (await loadSnapshots(userId, chatId)).slice(-settings.trackerSnapshotCount);
+    if (snapshots.length === 0) return messages;
+    const transform = settings.snapshotTransformPresets[settings.snapshotTransformPresetKey] ?? settings.snapshotTransformPresets.default_json;
+    const injected = snapshots.map((snapshot) => ({
+      role: settings.snapshotRole,
+      ...settings.injectAsVirtualCharacter ? { name: "Tracker" } : {},
+      content: formatTrackerSnapshot(snapshot, settings.snapshotHeader || snapshot.schemaPresetKey, transform)
     }));
     return {
       messages: [...injected, ...messages],
@@ -844,11 +1358,9 @@ function tryRegisterInterceptor() {
   spindle.log.info("Tracktor interceptor registered.");
 }
 spindle.permissions?.onChanged?.(({ permission, granted }) => {
-  if (permission === "interceptor" && granted) {
-    tryRegisterInterceptor();
-  }
+  if (permission === "interceptor" && granted) tryRegisterInterceptor();
 });
-void loadSettings().then(() => {
+void (async () => {
   tryRegisterInterceptor();
   spindle.log.info("Tracktor backend loaded.");
-});
+})();

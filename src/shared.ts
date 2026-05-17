@@ -1,12 +1,16 @@
 export const EXTENSION_ID = 'tracktor';
 export const METADATA_KEY = 'tracktor';
 export const SETTINGS_PATH = 'settings.json';
-export const VERSION = '0.1.2';
+export const SCHEMA_PRESETS_PATH = 'schema-presets.json';
+export const DIAGNOSTICS_PATH = 'diagnostics/latest.json';
+export const VERSION = '0.2.0';
 
 export type MessageRole = 'system' | 'user' | 'assistant';
-export type TrackerGenerationMode = 'json' | 'native_json';
-export type TrackerAutoMode = 'off' | 'assistant_message' | 'user_message';
-export type TrackerInjectionRole = 'system' | 'user' | 'assistant';
+export type TrackerAutoMode = 'none' | 'responses' | 'inputs' | 'both';
+export type StructuredOutputMode = 'native_json_schema' | 'json_prompt' | 'xml_prompt' | 'toon_prompt';
+export type TrackerConversationRoleMode = 'preserve' | 'all_assistant' | 'plain_transcript';
+export type TrackerWorldBookMode = 'include_all' | 'exclude_all' | 'allowlist';
+export type SnapshotTransformPresetKey = 'default_json' | 'minimal' | 'toon' | 'custom';
 
 export interface LlmMessageDTO {
   role: MessageRole;
@@ -18,6 +22,7 @@ export interface ChatMessageDTO {
   id: string;
   role: MessageRole;
   content: string;
+  name?: string;
   extra?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
   swipe_id?: number;
@@ -27,14 +32,44 @@ export interface ChatMessageDTO {
 
 export interface SchemaPreset {
   id: string;
+  key: string;
   name: string;
   description?: string;
   schema: Record<string, unknown>;
+  jsonSchema: Record<string, unknown>;
   templateHtml: string;
+  renderTemplate: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface TrackerSnapshot {
+  id: string;
+  chatId: string;
+  messageId: string;
+  schemaPresetKey: string;
+  value: Record<string, unknown>;
+  renderTemplate: string;
+  partsOrder: string[];
+  partsMeta: Record<string, unknown>;
+  pendingRedactions: Record<string, unknown>;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface TrackerSnapshotFile {
+  chatId: string;
+  snapshots: TrackerSnapshot[];
+}
+
+export interface TrackerMetadataMirror {
+  snapshotId: string;
+  updatedAt: number;
 }
 
 export interface TrackerRecord {
   version: string;
+  snapshotId?: string;
   schemaId: string;
   schemaName: string;
   schema: Record<string, unknown>;
@@ -43,13 +78,18 @@ export interface TrackerRecord {
   renderedHtml: string;
   updatedAt: string;
   sourceMessageId: string;
+  pendingRedactions?: Record<string, unknown>;
 }
 
-export interface TrackerInjectionSettings {
-  enabled: boolean;
-  includeLastTrackers: number;
-  role: TrackerInjectionRole;
-  header: string;
+export interface SnapshotTransformPreset {
+  key: SnapshotTransformPresetKey;
+  name: string;
+  input: 'pretty_json' | 'top_level_lines' | 'toon';
+  regexPattern: string;
+  regexFlags: string;
+  replacement: string;
+  codeFenceLang: string;
+  wrapInCodeFence: boolean;
 }
 
 export interface ChatVariableExportSettings {
@@ -57,25 +97,58 @@ export interface ChatVariableExportSettings {
   key: string;
 }
 
+export interface LegacyInjectionSettings {
+  enabled: boolean;
+  includeLastTrackers: number;
+  role: MessageRole;
+  header: string;
+}
+
 export interface TracktorSettings {
   version: string;
-  activeSchemaId: string;
   schemaPresets: Record<string, SchemaPreset>;
-  generationMode: TrackerGenerationMode;
+  activeSchemaPresetKey: string;
+  activeSchemaId: string;
+  trackerConnectionId: string | null;
+  trackerPresetId: string | null;
+  autoMode: TrackerAutoMode;
+  sequentialGeneration: boolean;
+  sequentialPartGeneration: boolean;
   maxResponseTokens: number;
+  skipFirstMessages: number;
+  trackerContextMessageLimit: number;
   includeLastMessages: number;
   includeLastTrackers: number;
-  sequentialPartGeneration: boolean;
-  autoMode: TrackerAutoMode;
+  includeCharacterCardInTrackerPrompt: boolean;
+  trackerConversationRoleMode: TrackerConversationRoleMode;
+  structuredOutputMode: StructuredOutputMode;
+  generationMode: 'json' | 'native_json';
   systemPrompt: string;
   extractionPrompt: string;
-  injection: TrackerInjectionSettings;
+  trackerInstructionPrompt: string;
+  jsonPromptTemplate: string;
+  xmlPromptTemplate: string;
+  toonPromptTemplate: string;
+  trackerSystemPromptSource: 'active_preset' | 'selected_tracker_preset' | 'saved_tracker_prompt';
+  savedTrackerPromptId: string | null;
+  injectTrackerSnapshots: boolean;
+  trackerSnapshotCount: number;
+  snapshotRole: MessageRole;
+  injectAsVirtualCharacter: boolean;
+  snapshotHeader: string;
+  snapshotTransformPresetKey: SnapshotTransformPresetKey;
+  snapshotTransformPresets: Record<string, SnapshotTransformPreset>;
+  injection: LegacyInjectionSettings;
   chatVariableExport: ChatVariableExportSettings;
+  trackerWorldBookMode: TrackerWorldBookMode;
+  allowedWorldBookIds: string[];
+  allowedWorldBookEntryIds: string[];
   debugLogging: boolean;
 }
 
 export interface ChatTracktorConfig {
   schemaId?: string;
+  schemaPresetKey?: string;
 }
 
 export interface TrackerSummary {
@@ -83,6 +156,7 @@ export interface TrackerSummary {
   messageId: string;
   role: MessageRole;
   messagePreview: string;
+  snapshot: TrackerSnapshot;
   tracker: TrackerRecord;
 }
 
@@ -93,17 +167,51 @@ export interface ActiveChatState {
   trackers: TrackerSummary[];
 }
 
+export interface TrackerJobState {
+  id: string;
+  chatId: string;
+  messageId?: string;
+  label: string;
+  status: 'running' | 'failed' | 'complete';
+  currentPart?: number;
+  totalParts?: number;
+  error?: string;
+}
+
 export interface FrontendState {
   settings: TracktorSettings;
   activeChat: ActiveChatState | null;
   permissionWarnings: string[];
   busy: boolean;
+  jobs: TrackerJobState[];
+  diagnostics: string[];
   lastError?: string;
 }
 
 export const DEFAULT_SYSTEM_PROMPT = `You are a structured tracker extraction assistant. Analyze the conversation and return only tracker data that matches the requested schema. Do not roleplay, continue the scene, explain yourself, or include markdown unless the tracker format instructions explicitly ask for it. Preserve continuity with previous tracker snapshots, but update the tracker from the newest chat evidence.`;
 
 export const DEFAULT_EXTRACTION_PROMPT = `Create a complete tracker update for the target message. Fill every required field. If a field is not explicitly stated, infer a short, reasonable value from the conversation context. Keep values concise and concrete.`;
+
+export const DEFAULT_JSON_PROMPT_TEMPLATE = [
+  'Return only one valid JSON object.',
+  'Do not include markdown fences, commentary, or prose outside JSON.',
+  'The object must conform to this JSON Schema:',
+  '{{schema}}',
+  'Example shape:',
+  '{{example_response}}',
+].join('\n\n');
+
+export const DEFAULT_XML_PROMPT_TEMPLATE = [
+  'Return tracker data as valid JSON even if the model was asked for XML-style structure.',
+  'Use this schema as the authority:',
+  '{{schema}}',
+].join('\n\n');
+
+export const DEFAULT_TOON_PROMPT_TEMPLATE = [
+  'Return tracker data as valid JSON. Keep values compact like TOON, but the response must still parse as JSON.',
+  'Use this schema as the authority:',
+  '{{schema}}',
+].join('\n\n');
 
 export const DEFAULT_SCHEMA: Record<string, unknown> = {
   $schema: 'http://json-schema.org/draft-07/schema#',
@@ -181,26 +289,86 @@ export const DEFAULT_TEMPLATE_HTML = `
 </section>
 `.trim();
 
+export const defaultSchemaPresets: Record<string, SchemaPreset> = {
+  scene: normalizeSchemaPreset({
+    key: 'scene',
+    id: 'scene',
+    name: 'Scene Tracker',
+    description: 'General roleplay scene state.',
+    jsonSchema: DEFAULT_SCHEMA,
+    schema: DEFAULT_SCHEMA,
+    renderTemplate: DEFAULT_TEMPLATE_HTML,
+    templateHtml: DEFAULT_TEMPLATE_HTML,
+  }, 'scene'),
+};
+
+export const defaultSnapshotTransformPresets: Record<string, SnapshotTransformPreset> = {
+  default_json: {
+    key: 'default_json',
+    name: 'Default JSON',
+    input: 'pretty_json',
+    regexPattern: '',
+    regexFlags: '',
+    replacement: '',
+    codeFenceLang: 'json',
+    wrapInCodeFence: true,
+  },
+  minimal: {
+    key: 'minimal',
+    name: 'Minimal Lines',
+    input: 'top_level_lines',
+    regexPattern: '',
+    regexFlags: '',
+    replacement: '',
+    codeFenceLang: '',
+    wrapInCodeFence: false,
+  },
+  toon: {
+    key: 'toon',
+    name: 'TOON',
+    input: 'toon',
+    regexPattern: '',
+    regexFlags: '',
+    replacement: '',
+    codeFenceLang: 'toon',
+    wrapInCodeFence: true,
+  },
+};
+
 export const defaultSettings: TracktorSettings = {
   version: VERSION,
+  schemaPresets: structuredClone(defaultSchemaPresets),
+  activeSchemaPresetKey: 'scene',
   activeSchemaId: 'scene',
-  schemaPresets: {
-    scene: {
-      id: 'scene',
-      name: 'Scene Tracker',
-      description: 'General roleplay scene state.',
-      schema: DEFAULT_SCHEMA,
-      templateHtml: DEFAULT_TEMPLATE_HTML,
-    },
-  },
-  generationMode: 'json',
-  maxResponseTokens: 1800,
+  trackerConnectionId: null,
+  trackerPresetId: null,
+  autoMode: 'none',
+  sequentialGeneration: false,
+  sequentialPartGeneration: false,
+  maxResponseTokens: 4096,
+  skipFirstMessages: 0,
+  trackerContextMessageLimit: 12,
   includeLastMessages: 12,
   includeLastTrackers: 1,
-  sequentialPartGeneration: false,
-  autoMode: 'off',
+  includeCharacterCardInTrackerPrompt: false,
+  trackerConversationRoleMode: 'preserve',
+  structuredOutputMode: 'json_prompt',
+  generationMode: 'json',
   systemPrompt: DEFAULT_SYSTEM_PROMPT,
   extractionPrompt: DEFAULT_EXTRACTION_PROMPT,
+  trackerInstructionPrompt: DEFAULT_EXTRACTION_PROMPT,
+  jsonPromptTemplate: DEFAULT_JSON_PROMPT_TEMPLATE,
+  xmlPromptTemplate: DEFAULT_XML_PROMPT_TEMPLATE,
+  toonPromptTemplate: DEFAULT_TOON_PROMPT_TEMPLATE,
+  trackerSystemPromptSource: 'saved_tracker_prompt',
+  savedTrackerPromptId: null,
+  injectTrackerSnapshots: true,
+  trackerSnapshotCount: 1,
+  snapshotRole: 'system',
+  injectAsVirtualCharacter: false,
+  snapshotHeader: 'Recent tracker snapshot',
+  snapshotTransformPresetKey: 'default_json',
+  snapshotTransformPresets: structuredClone(defaultSnapshotTransformPresets),
   injection: {
     enabled: true,
     includeLastTrackers: 1,
@@ -211,76 +379,165 @@ export const defaultSettings: TracktorSettings = {
     enabled: true,
     key: 'tracktor',
   },
+  trackerWorldBookMode: 'include_all',
+  allowedWorldBookIds: [],
+  allowedWorldBookEntryIds: [],
   debugLogging: false,
 };
 
-export function deepMergeSettings(input: unknown): TracktorSettings {
+export function deepMergeSettings(input: unknown, schemaPresets?: Record<string, SchemaPreset>): TracktorSettings {
   const saved = isPlainObject(input) ? input as Record<string, unknown> : {};
   const merged: TracktorSettings = structuredClone(defaultSettings);
 
   assignKnown(merged, saved, [
     'version',
-    'activeSchemaId',
-    'generationMode',
+    'trackerConnectionId',
+    'trackerPresetId',
     'maxResponseTokens',
+    'skipFirstMessages',
+    'trackerContextMessageLimit',
     'includeLastMessages',
     'includeLastTrackers',
-    'sequentialPartGeneration',
-    'autoMode',
+    'includeCharacterCardInTrackerPrompt',
     'systemPrompt',
     'extractionPrompt',
+    'trackerInstructionPrompt',
+    'jsonPromptTemplate',
+    'xmlPromptTemplate',
+    'toonPromptTemplate',
+    'trackerSystemPromptSource',
+    'savedTrackerPromptId',
+    'injectTrackerSnapshots',
+    'trackerSnapshotCount',
+    'injectAsVirtualCharacter',
+    'snapshotHeader',
     'debugLogging',
   ]);
 
-  if (isPlainObject(saved.schemaPresets)) {
-    merged.schemaPresets = {};
-    for (const [id, value] of Object.entries(saved.schemaPresets as Record<string, unknown>)) {
-      if (!isPlainObject(value)) continue;
-      const preset = value as Record<string, unknown>;
-      if (!isPlainObject(preset.schema) || typeof preset.templateHtml !== 'string') continue;
-      const normalizedId = sanitizeId(typeof preset.id === 'string' ? preset.id : id) || id;
-      merged.schemaPresets[normalizedId] = {
-        id: normalizedId,
-        name: typeof preset.name === 'string' && preset.name.trim() ? preset.name : normalizedId,
-        description: typeof preset.description === 'string' ? preset.description : undefined,
-        schema: preset.schema as Record<string, unknown>,
-        templateHtml: preset.templateHtml,
-      };
-    }
-    if (Object.keys(merged.schemaPresets).length === 0) {
-      merged.schemaPresets = structuredClone(defaultSettings.schemaPresets);
-    }
+  merged.schemaPresets = sanitizeSchemaPresetMap(schemaPresets ?? saved.schemaPresets);
+  merged.activeSchemaPresetKey = sanitizeId(readString(saved.activeSchemaPresetKey) || readString(saved.activeSchemaId) || merged.activeSchemaPresetKey) || 'scene';
+  merged.activeSchemaId = merged.activeSchemaPresetKey;
+
+  merged.autoMode = normalizeAutoMode(saved.autoMode);
+  merged.sequentialGeneration = readBool(saved.sequentialGeneration, readBool(saved.sequentialPartGeneration, merged.sequentialGeneration));
+  merged.sequentialPartGeneration = merged.sequentialGeneration;
+  merged.structuredOutputMode = normalizeStructuredOutputMode(saved.structuredOutputMode ?? saved.generationMode);
+  merged.generationMode = merged.structuredOutputMode === 'native_json_schema' ? 'native_json' : 'json';
+  merged.trackerConversationRoleMode = normalizeEnum(saved.trackerConversationRoleMode, ['preserve', 'all_assistant', 'plain_transcript'], 'preserve');
+  merged.snapshotRole = normalizeEnum(saved.snapshotRole, ['system', 'user', 'assistant'], 'system');
+  merged.trackerWorldBookMode = normalizeEnum(saved.trackerWorldBookMode, ['include_all', 'exclude_all', 'allowlist'], 'include_all');
+  merged.snapshotTransformPresetKey = normalizeEnum(saved.snapshotTransformPresetKey, ['default_json', 'minimal', 'toon', 'custom'], 'default_json');
+  merged.allowedWorldBookIds = sanitizeStringArray(saved.allowedWorldBookIds);
+  merged.allowedWorldBookEntryIds = sanitizeStringArray(saved.allowedWorldBookEntryIds);
+  if (saved.trackerContextMessageLimit === undefined && saved.includeLastMessages !== undefined) {
+    merged.trackerContextMessageLimit = saved.includeLastMessages as number;
+  }
+  if (saved.trackerInstructionPrompt === undefined && typeof saved.extractionPrompt === 'string') {
+    merged.trackerInstructionPrompt = saved.extractionPrompt;
+  }
+
+  if (isPlainObject(saved.snapshotTransformPresets)) {
+    merged.snapshotTransformPresets = {
+      ...structuredClone(defaultSnapshotTransformPresets),
+      ...sanitizeSnapshotTransformPresets(saved.snapshotTransformPresets),
+    };
   }
 
   if (isPlainObject(saved.injection)) {
-    assignKnown(merged.injection, saved.injection as Record<string, unknown>, [
-      'enabled',
-      'includeLastTrackers',
-      'role',
-      'header',
-    ]);
+    const injection = saved.injection as Record<string, unknown>;
+    merged.injectTrackerSnapshots = readBool(injection.enabled, merged.injectTrackerSnapshots);
+    merged.trackerSnapshotCount = sanitizeInteger(injection.includeLastTrackers, merged.trackerSnapshotCount, 0, 25);
+    merged.snapshotRole = normalizeEnum(injection.role, ['system', 'user', 'assistant'], merged.snapshotRole);
+    merged.snapshotHeader = readString(injection.header) || merged.snapshotHeader;
   }
 
   if (isPlainObject(saved.chatVariableExport)) {
     assignKnown(merged.chatVariableExport, saved.chatVariableExport as Record<string, unknown>, ['enabled', 'key']);
   }
 
-  merged.activeSchemaId = merged.schemaPresets[merged.activeSchemaId] ? merged.activeSchemaId : Object.keys(merged.schemaPresets)[0];
-  merged.maxResponseTokens = sanitizeInteger(merged.maxResponseTokens, 1800, 1, 64000);
-  merged.includeLastMessages = sanitizeInteger(merged.includeLastMessages, 12, 1, 200);
+  merged.maxResponseTokens = sanitizeInteger(merged.maxResponseTokens, 4096, 1, 64000);
+  merged.skipFirstMessages = sanitizeInteger(merged.skipFirstMessages, 0, 0, 1000);
+  merged.trackerContextMessageLimit = sanitizeInteger(merged.trackerContextMessageLimit, merged.includeLastMessages, 0, 400);
+  merged.includeLastMessages = merged.trackerContextMessageLimit;
   merged.includeLastTrackers = sanitizeInteger(merged.includeLastTrackers, 1, 0, 25);
-  merged.injection.includeLastTrackers = sanitizeInteger(merged.injection.includeLastTrackers, 1, 0, 25);
-  merged.generationMode = merged.generationMode === 'native_json' ? 'native_json' : 'json';
-  merged.autoMode = ['off', 'assistant_message', 'user_message'].includes(merged.autoMode) ? merged.autoMode : 'off';
-  merged.injection.role = ['system', 'user', 'assistant'].includes(merged.injection.role) ? merged.injection.role : 'system';
-  merged.chatVariableExport.key = sanitizeVariableKey(merged.chatVariableExport.key) || 'tracktor';
+  merged.trackerSnapshotCount = sanitizeInteger(merged.trackerSnapshotCount, 1, 0, 25);
+  merged.injection = {
+    enabled: merged.injectTrackerSnapshots,
+    includeLastTrackers: merged.trackerSnapshotCount,
+    role: merged.snapshotRole,
+    header: merged.snapshotHeader,
+  };
+  merged.chatVariableExport.enabled = readBool(merged.chatVariableExport.enabled, true);
+  merged.chatVariableExport.key = sanitizeVariableKey(String(merged.chatVariableExport.key ?? 'tracktor')) || 'tracktor';
+  merged.trackerConnectionId = normalizeNullableString(merged.trackerConnectionId);
+  merged.trackerPresetId = normalizeNullableString(merged.trackerPresetId);
+  merged.savedTrackerPromptId = normalizeNullableString(merged.savedTrackerPromptId);
+  merged.trackerInstructionPrompt = merged.trackerInstructionPrompt || merged.extractionPrompt || DEFAULT_EXTRACTION_PROMPT;
+  merged.extractionPrompt = merged.trackerInstructionPrompt;
+
+  if (!merged.schemaPresets[merged.activeSchemaPresetKey]) {
+    merged.activeSchemaPresetKey = Object.keys(merged.schemaPresets)[0] ?? 'scene';
+    merged.activeSchemaId = merged.activeSchemaPresetKey;
+  }
+  if (!merged.schemaPresets[merged.activeSchemaPresetKey]) {
+    merged.schemaPresets = structuredClone(defaultSchemaPresets);
+    merged.activeSchemaPresetKey = 'scene';
+    merged.activeSchemaId = 'scene';
+  }
 
   return merged;
 }
 
+export function settingsForStorage(settings: TracktorSettings): Record<string, unknown> {
+  const copy = structuredClone(settings) as unknown as Record<string, unknown>;
+  delete copy.schemaPresets;
+  delete copy.activeSchemaId;
+  delete copy.generationMode;
+  delete copy.sequentialPartGeneration;
+  delete copy.includeLastMessages;
+  delete copy.injection;
+  delete copy.extractionPrompt;
+  return copy;
+}
+
+export function sanitizeSchemaPresetMap(input: unknown): Record<string, SchemaPreset> {
+  if (!isPlainObject(input)) return structuredClone(defaultSchemaPresets);
+  const out: Record<string, SchemaPreset> = {};
+  for (const [fallbackKey, value] of Object.entries(input)) {
+    if (!isPlainObject(value)) continue;
+    const preset = normalizeSchemaPreset(value, fallbackKey);
+    if (preset) out[preset.key] = preset;
+  }
+  return Object.keys(out).length > 0 ? out : structuredClone(defaultSchemaPresets);
+}
+
+export function normalizeSchemaPreset(input: unknown, fallbackKey = 'schema'): SchemaPreset {
+  const value = isPlainObject(input) ? input : {};
+  const key = sanitizeId(readString(value.key) || readString(value.id) || fallbackKey) || sanitizeId(fallbackKey) || 'schema';
+  const schema = isPlainObject(value.jsonSchema)
+    ? value.jsonSchema
+    : isPlainObject(value.schema)
+      ? value.schema
+      : DEFAULT_SCHEMA;
+  const template = readString(value.renderTemplate) || readString(value.templateHtml) || DEFAULT_TEMPLATE_HTML;
+  const now = Date.now();
+  return {
+    id: key,
+    key,
+    name: readString(value.name) || key,
+    description: readString(value.description) || undefined,
+    schema: schema as Record<string, unknown>,
+    jsonSchema: schema as Record<string, unknown>,
+    templateHtml: template,
+    renderTemplate: template,
+    createdAt: sanitizeInteger(value.createdAt, now, 0, Number.MAX_SAFE_INTEGER),
+    updatedAt: sanitizeInteger(value.updatedAt, now, 0, Number.MAX_SAFE_INTEGER),
+  };
+}
+
 export function getSchemaPreset(settings: TracktorSettings, preferredId?: string): SchemaPreset {
-  const id = preferredId && settings.schemaPresets[preferredId] ? preferredId : settings.activeSchemaId;
-  return settings.schemaPresets[id] ?? settings.schemaPresets[Object.keys(settings.schemaPresets)[0]];
+  const key = preferredId && settings.schemaPresets[preferredId] ? preferredId : settings.activeSchemaPresetKey;
+  return settings.schemaPresets[key] ?? settings.schemaPresets[Object.keys(settings.schemaPresets)[0]];
 }
 
 export function getTopLevelSchemaKeys(schema: Record<string, unknown>): string[] {
@@ -292,9 +549,7 @@ export function getTopLevelSchemaKeys(schema: Record<string, unknown>): string[]
 export function buildTopLevelPartSchema(schema: Record<string, unknown>, key: string): Record<string, unknown> {
   const properties = isPlainObject(schema.properties) ? schema.properties as Record<string, unknown> : {};
   const property = properties[key];
-  if (!property) {
-    throw new Error(`Unknown schema part: ${key}`);
-  }
+  if (!property) throw new Error(`Unknown schema part: ${key}`);
   return {
     $schema: schema.$schema ?? 'http://json-schema.org/draft-07/schema#',
     title: `${String(schema.title ?? 'Tracker')}Part`,
@@ -313,9 +568,7 @@ export function schemaToExample(schema: unknown): unknown {
     case 'object': {
       const out: Record<string, unknown> = {};
       const properties = isPlainObject(schema.properties) ? schema.properties as Record<string, unknown> : {};
-      for (const [key, value] of Object.entries(properties)) {
-        out[key] = schemaToExample(value);
-      }
+      for (const [key, value] of Object.entries(properties)) out[key] = schemaToExample(value);
       return out;
     }
     case 'array':
@@ -337,8 +590,60 @@ export function renderTrackerTemplate(templateHtml: string, data: unknown): stri
   return renderScopedTemplate(withoutScripts, data, data);
 }
 
-export function formatTrackerSnapshot(record: TrackerRecord | { data: unknown }, header = 'Tracker'): string {
-  return `${header}\n\`\`\`json\n${JSON.stringify(record.data, null, 2)}\n\`\`\``;
+export function snapshotToRecord(snapshot: TrackerSnapshot, preset?: SchemaPreset): TrackerRecord {
+  const schema = preset?.schema ?? preset?.jsonSchema ?? {};
+  const template = snapshot.renderTemplate || preset?.templateHtml || preset?.renderTemplate || '';
+  return {
+    version: VERSION,
+    snapshotId: snapshot.id,
+    schemaId: snapshot.schemaPresetKey,
+    schemaName: preset?.name ?? snapshot.schemaPresetKey,
+    schema,
+    templateHtml: template,
+    data: snapshot.value,
+    renderedHtml: safeRenderTracker(template, snapshot.value),
+    updatedAt: new Date(snapshot.updatedAt).toISOString(),
+    sourceMessageId: snapshot.messageId,
+    pendingRedactions: snapshot.pendingRedactions,
+  };
+}
+
+export function safeRenderTracker(templateHtml: string, data: unknown): string {
+  try {
+    return renderTrackerTemplate(templateHtml, data);
+  } catch {
+    return `<pre>${escapeHtml(JSON.stringify(data, null, 2))}</pre>`;
+  }
+}
+
+export function formatTrackerSnapshot(
+  record: TrackerRecord | TrackerSnapshot | { data?: unknown; value?: unknown },
+  header = 'Tracker',
+  transform: SnapshotTransformPreset = defaultSnapshotTransformPresets.default_json,
+): string {
+  const data = 'value' in record ? record.value : 'data' in record ? record.data : record;
+  let body = formatSnapshotBody(data, transform.input);
+  if (transform.regexPattern) {
+    try {
+      body = body.replace(new RegExp(transform.regexPattern, transform.regexFlags), transform.replacement);
+    } catch {
+      // Keep the base snapshot if a custom regex is invalid.
+    }
+  }
+  const fenced = transform.wrapInCodeFence
+    ? `\`\`\`${transform.codeFenceLang}\n${body}\n\`\`\``
+    : body;
+  return `${header}\n${fenced}`;
+}
+
+export function formatSnapshotBody(data: unknown, input: SnapshotTransformPreset['input']): string {
+  if (input === 'top_level_lines' && isPlainObject(data)) {
+    return Object.entries(data)
+      .map(([key, value]) => `${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`)
+      .join('\n');
+  }
+  if (input === 'toon') return toToon(data);
+  return JSON.stringify(data, null, 2);
 }
 
 export function safePreview(value: string, max = 160): string {
@@ -373,20 +678,86 @@ export function sanitizeVariableKey(value: string): string {
   return value.trim().replace(/[^a-zA-Z0-9_.-]+/g, '_').slice(0, 80);
 }
 
+export function safeStorageKey(value: string): string {
+  const sanitized = value.replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 120);
+  return sanitized || 'unknown';
+}
+
 export function chatConfigPath(chatId: string): string {
-  return `chats/${chatId.replace(/[^a-zA-Z0-9_.-]/g, '_')}.json`;
+  return `chats/${safeStorageKey(chatId)}.json`;
+}
+
+export function snapshotsPath(chatId: string): string {
+  return `snapshots/${safeStorageKey(chatId)}.json`;
+}
+
+export function jobsPath(chatId: string): string {
+  return `jobs/${safeStorageKey(chatId)}.json`;
 }
 
 export function isPlainObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
+function sanitizeSnapshotTransformPresets(input: Record<string, unknown>): Record<string, SnapshotTransformPreset> {
+  const out: Record<string, SnapshotTransformPreset> = {};
+  for (const [key, raw] of Object.entries(input)) {
+    if (!isPlainObject(raw)) continue;
+    const presetKey = normalizeEnum(raw.key ?? key, ['default_json', 'minimal', 'toon', 'custom'], 'custom');
+    out[key] = {
+      key: presetKey,
+      name: readString(raw.name) || key,
+      input: normalizeEnum(raw.input, ['pretty_json', 'top_level_lines', 'toon'], 'pretty_json'),
+      regexPattern: readString(raw.regexPattern),
+      regexFlags: readString(raw.regexFlags),
+      replacement: readString(raw.replacement),
+      codeFenceLang: readString(raw.codeFenceLang),
+      wrapInCodeFence: readBool(raw.wrapInCodeFence, presetKey !== 'minimal'),
+    };
+  }
+  return out;
+}
+
+function normalizeAutoMode(value: unknown): TrackerAutoMode {
+  if (value === 'off') return 'none';
+  if (value === 'assistant_message') return 'responses';
+  if (value === 'user_message') return 'inputs';
+  return normalizeEnum(value, ['none', 'responses', 'inputs', 'both'], 'none');
+}
+
+function normalizeStructuredOutputMode(value: unknown): StructuredOutputMode {
+  if (value === 'native_json') return 'native_json_schema';
+  if (value === 'json') return 'json_prompt';
+  return normalizeEnum(value, ['native_json_schema', 'json_prompt', 'xml_prompt', 'toon_prompt'], 'json_prompt');
+}
+
+function normalizeEnum<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
+  return typeof value === 'string' && (allowed as readonly string[]).includes(value) ? value as T : fallback;
+}
+
+function normalizeNullableString(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+function sanitizeStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => typeof item === 'string' && item.trim() ? [item.trim()] : []);
+}
+
+function readString(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+function readBool(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback;
+}
+
 function assignKnown(target: object, source: Record<string, unknown>, keys: string[]): void {
   const writable = target as Record<string, unknown>;
   for (const key of keys) {
-    if (source[key] !== undefined) {
-      writable[key] = source[key];
-    }
+    if (source[key] !== undefined) writable[key] = source[key];
   }
 }
 
@@ -446,4 +817,16 @@ function resolveTemplatePath(path: string, scope: unknown, rootData: unknown): u
   }
 
   return current ?? '';
+}
+
+function toToon(data: unknown, indent = ''): string {
+  if (Array.isArray(data)) {
+    return data.map((item, index) => `${indent}${index}: ${isPlainObject(item) || Array.isArray(item) ? `\n${toToon(item, `${indent}  `)}` : String(item)}`).join('\n');
+  }
+  if (isPlainObject(data)) {
+    return Object.entries(data)
+      .map(([key, value]) => `${indent}${key}: ${isPlainObject(value) || Array.isArray(value) ? `\n${toToon(value, `${indent}  `)}` : String(value)}`)
+      .join('\n');
+  }
+  return String(data ?? '');
 }

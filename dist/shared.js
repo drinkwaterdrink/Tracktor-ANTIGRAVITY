@@ -1,9 +1,29 @@
 export const EXTENSION_ID = 'tracktor';
 export const METADATA_KEY = 'tracktor';
 export const SETTINGS_PATH = 'settings.json';
-export const VERSION = '0.1.2';
+export const SCHEMA_PRESETS_PATH = 'schema-presets.json';
+export const DIAGNOSTICS_PATH = 'diagnostics/latest.json';
+export const VERSION = '0.2.0';
 export const DEFAULT_SYSTEM_PROMPT = `You are a structured tracker extraction assistant. Analyze the conversation and return only tracker data that matches the requested schema. Do not roleplay, continue the scene, explain yourself, or include markdown unless the tracker format instructions explicitly ask for it. Preserve continuity with previous tracker snapshots, but update the tracker from the newest chat evidence.`;
 export const DEFAULT_EXTRACTION_PROMPT = `Create a complete tracker update for the target message. Fill every required field. If a field is not explicitly stated, infer a short, reasonable value from the conversation context. Keep values concise and concrete.`;
+export const DEFAULT_JSON_PROMPT_TEMPLATE = [
+    'Return only one valid JSON object.',
+    'Do not include markdown fences, commentary, or prose outside JSON.',
+    'The object must conform to this JSON Schema:',
+    '{{schema}}',
+    'Example shape:',
+    '{{example_response}}',
+].join('\n\n');
+export const DEFAULT_XML_PROMPT_TEMPLATE = [
+    'Return tracker data as valid JSON even if the model was asked for XML-style structure.',
+    'Use this schema as the authority:',
+    '{{schema}}',
+].join('\n\n');
+export const DEFAULT_TOON_PROMPT_TEMPLATE = [
+    'Return tracker data as valid JSON. Keep values compact like TOON, but the response must still parse as JSON.',
+    'Use this schema as the authority:',
+    '{{schema}}',
+].join('\n\n');
 export const DEFAULT_SCHEMA = {
     $schema: 'http://json-schema.org/draft-07/schema#',
     title: 'SceneTracker',
@@ -78,26 +98,84 @@ export const DEFAULT_TEMPLATE_HTML = `
   </details>
 </section>
 `.trim();
+export const defaultSchemaPresets = {
+    scene: normalizeSchemaPreset({
+        key: 'scene',
+        id: 'scene',
+        name: 'Scene Tracker',
+        description: 'General roleplay scene state.',
+        jsonSchema: DEFAULT_SCHEMA,
+        schema: DEFAULT_SCHEMA,
+        renderTemplate: DEFAULT_TEMPLATE_HTML,
+        templateHtml: DEFAULT_TEMPLATE_HTML,
+    }, 'scene'),
+};
+export const defaultSnapshotTransformPresets = {
+    default_json: {
+        key: 'default_json',
+        name: 'Default JSON',
+        input: 'pretty_json',
+        regexPattern: '',
+        regexFlags: '',
+        replacement: '',
+        codeFenceLang: 'json',
+        wrapInCodeFence: true,
+    },
+    minimal: {
+        key: 'minimal',
+        name: 'Minimal Lines',
+        input: 'top_level_lines',
+        regexPattern: '',
+        regexFlags: '',
+        replacement: '',
+        codeFenceLang: '',
+        wrapInCodeFence: false,
+    },
+    toon: {
+        key: 'toon',
+        name: 'TOON',
+        input: 'toon',
+        regexPattern: '',
+        regexFlags: '',
+        replacement: '',
+        codeFenceLang: 'toon',
+        wrapInCodeFence: true,
+    },
+};
 export const defaultSettings = {
     version: VERSION,
+    schemaPresets: structuredClone(defaultSchemaPresets),
+    activeSchemaPresetKey: 'scene',
     activeSchemaId: 'scene',
-    schemaPresets: {
-        scene: {
-            id: 'scene',
-            name: 'Scene Tracker',
-            description: 'General roleplay scene state.',
-            schema: DEFAULT_SCHEMA,
-            templateHtml: DEFAULT_TEMPLATE_HTML,
-        },
-    },
-    generationMode: 'json',
-    maxResponseTokens: 1800,
+    trackerConnectionId: null,
+    trackerPresetId: null,
+    autoMode: 'none',
+    sequentialGeneration: false,
+    sequentialPartGeneration: false,
+    maxResponseTokens: 4096,
+    skipFirstMessages: 0,
+    trackerContextMessageLimit: 12,
     includeLastMessages: 12,
     includeLastTrackers: 1,
-    sequentialPartGeneration: false,
-    autoMode: 'off',
+    includeCharacterCardInTrackerPrompt: false,
+    trackerConversationRoleMode: 'preserve',
+    structuredOutputMode: 'json_prompt',
+    generationMode: 'json',
     systemPrompt: DEFAULT_SYSTEM_PROMPT,
     extractionPrompt: DEFAULT_EXTRACTION_PROMPT,
+    trackerInstructionPrompt: DEFAULT_EXTRACTION_PROMPT,
+    jsonPromptTemplate: DEFAULT_JSON_PROMPT_TEMPLATE,
+    xmlPromptTemplate: DEFAULT_XML_PROMPT_TEMPLATE,
+    toonPromptTemplate: DEFAULT_TOON_PROMPT_TEMPLATE,
+    trackerSystemPromptSource: 'saved_tracker_prompt',
+    savedTrackerPromptId: null,
+    injectTrackerSnapshots: true,
+    trackerSnapshotCount: 1,
+    snapshotRole: 'system',
+    injectAsVirtualCharacter: false,
+    snapshotHeader: 'Recent tracker snapshot',
+    snapshotTransformPresetKey: 'default_json',
+    snapshotTransformPresets: structuredClone(defaultSnapshotTransformPresets),
     injection: {
         enabled: true,
         includeLastTrackers: 1,
@@ -108,70 +186,154 @@ export const defaultSettings = {
         enabled: true,
         key: 'tracktor',
     },
+    trackerWorldBookMode: 'include_all',
+    allowedWorldBookIds: [],
+    allowedWorldBookEntryIds: [],
     debugLogging: false,
 };
-export function deepMergeSettings(input) {
+export function deepMergeSettings(input, schemaPresets) {
     const saved = isPlainObject(input) ? input : {};
     const merged = structuredClone(defaultSettings);
     assignKnown(merged, saved, [
         'version',
-        'activeSchemaId',
-        'generationMode',
+        'trackerConnectionId',
+        'trackerPresetId',
         'maxResponseTokens',
+        'skipFirstMessages',
+        'trackerContextMessageLimit',
         'includeLastMessages',
         'includeLastTrackers',
-        'sequentialPartGeneration',
-        'autoMode',
+        'includeCharacterCardInTrackerPrompt',
         'systemPrompt',
         'extractionPrompt',
+        'trackerInstructionPrompt',
+        'jsonPromptTemplate',
+        'xmlPromptTemplate',
+        'toonPromptTemplate',
+        'trackerSystemPromptSource',
+        'savedTrackerPromptId',
+        'injectTrackerSnapshots',
+        'trackerSnapshotCount',
+        'injectAsVirtualCharacter',
+        'snapshotHeader',
         'debugLogging',
     ]);
-    if (isPlainObject(saved.schemaPresets)) {
-        merged.schemaPresets = {};
-        for (const [id, value] of Object.entries(saved.schemaPresets)) {
-            if (!isPlainObject(value))
-                continue;
-            const preset = value;
-            if (!isPlainObject(preset.schema) || typeof preset.templateHtml !== 'string')
-                continue;
-            const normalizedId = sanitizeId(typeof preset.id === 'string' ? preset.id : id) || id;
-            merged.schemaPresets[normalizedId] = {
-                id: normalizedId,
-                name: typeof preset.name === 'string' && preset.name.trim() ? preset.name : normalizedId,
-                description: typeof preset.description === 'string' ? preset.description : undefined,
-                schema: preset.schema,
-                templateHtml: preset.templateHtml,
-            };
-        }
-        if (Object.keys(merged.schemaPresets).length === 0) {
-            merged.schemaPresets = structuredClone(defaultSettings.schemaPresets);
-        }
+    merged.schemaPresets = sanitizeSchemaPresetMap(schemaPresets ?? saved.schemaPresets);
+    merged.activeSchemaPresetKey = sanitizeId(readString(saved.activeSchemaPresetKey) || readString(saved.activeSchemaId) || merged.activeSchemaPresetKey) || 'scene';
+    merged.activeSchemaId = merged.activeSchemaPresetKey;
+    merged.autoMode = normalizeAutoMode(saved.autoMode);
+    merged.sequentialGeneration = readBool(saved.sequentialGeneration, readBool(saved.sequentialPartGeneration, merged.sequentialGeneration));
+    merged.sequentialPartGeneration = merged.sequentialGeneration;
+    merged.structuredOutputMode = normalizeStructuredOutputMode(saved.structuredOutputMode ?? saved.generationMode);
+    merged.generationMode = merged.structuredOutputMode === 'native_json_schema' ? 'native_json' : 'json';
+    merged.trackerConversationRoleMode = normalizeEnum(saved.trackerConversationRoleMode, ['preserve', 'all_assistant', 'plain_transcript'], 'preserve');
+    merged.snapshotRole = normalizeEnum(saved.snapshotRole, ['system', 'user', 'assistant'], 'system');
+    merged.trackerWorldBookMode = normalizeEnum(saved.trackerWorldBookMode, ['include_all', 'exclude_all', 'allowlist'], 'include_all');
+    merged.snapshotTransformPresetKey = normalizeEnum(saved.snapshotTransformPresetKey, ['default_json', 'minimal', 'toon', 'custom'], 'default_json');
+    merged.allowedWorldBookIds = sanitizeStringArray(saved.allowedWorldBookIds);
+    merged.allowedWorldBookEntryIds = sanitizeStringArray(saved.allowedWorldBookEntryIds);
+    if (saved.trackerContextMessageLimit === undefined && saved.includeLastMessages !== undefined) {
+        merged.trackerContextMessageLimit = saved.includeLastMessages;
+    }
+    if (saved.trackerInstructionPrompt === undefined && typeof saved.extractionPrompt === 'string') {
+        merged.trackerInstructionPrompt = saved.extractionPrompt;
+    }
+    if (isPlainObject(saved.snapshotTransformPresets)) {
+        merged.snapshotTransformPresets = {
+            ...structuredClone(defaultSnapshotTransformPresets),
+            ...sanitizeSnapshotTransformPresets(saved.snapshotTransformPresets),
+        };
     }
     if (isPlainObject(saved.injection)) {
-        assignKnown(merged.injection, saved.injection, [
-            'enabled',
-            'includeLastTrackers',
-            'role',
-            'header',
-        ]);
+        const injection = saved.injection;
+        merged.injectTrackerSnapshots = readBool(injection.enabled, merged.injectTrackerSnapshots);
+        merged.trackerSnapshotCount = sanitizeInteger(injection.includeLastTrackers, merged.trackerSnapshotCount, 0, 25);
+        merged.snapshotRole = normalizeEnum(injection.role, ['system', 'user', 'assistant'], merged.snapshotRole);
+        merged.snapshotHeader = readString(injection.header) || merged.snapshotHeader;
     }
     if (isPlainObject(saved.chatVariableExport)) {
         assignKnown(merged.chatVariableExport, saved.chatVariableExport, ['enabled', 'key']);
     }
-    merged.activeSchemaId = merged.schemaPresets[merged.activeSchemaId] ? merged.activeSchemaId : Object.keys(merged.schemaPresets)[0];
-    merged.maxResponseTokens = sanitizeInteger(merged.maxResponseTokens, 1800, 1, 64000);
-    merged.includeLastMessages = sanitizeInteger(merged.includeLastMessages, 12, 1, 200);
+    merged.maxResponseTokens = sanitizeInteger(merged.maxResponseTokens, 4096, 1, 64000);
+    merged.skipFirstMessages = sanitizeInteger(merged.skipFirstMessages, 0, 0, 1000);
+    merged.trackerContextMessageLimit = sanitizeInteger(merged.trackerContextMessageLimit, merged.includeLastMessages, 0, 400);
+    merged.includeLastMessages = merged.trackerContextMessageLimit;
     merged.includeLastTrackers = sanitizeInteger(merged.includeLastTrackers, 1, 0, 25);
-    merged.injection.includeLastTrackers = sanitizeInteger(merged.injection.includeLastTrackers, 1, 0, 25);
-    merged.generationMode = merged.generationMode === 'native_json' ? 'native_json' : 'json';
-    merged.autoMode = ['off', 'assistant_message', 'user_message'].includes(merged.autoMode) ? merged.autoMode : 'off';
-    merged.injection.role = ['system', 'user', 'assistant'].includes(merged.injection.role) ? merged.injection.role : 'system';
-    merged.chatVariableExport.key = sanitizeVariableKey(merged.chatVariableExport.key) || 'tracktor';
+    merged.trackerSnapshotCount = sanitizeInteger(merged.trackerSnapshotCount, 1, 0, 25);
+    merged.injection = {
+        enabled: merged.injectTrackerSnapshots,
+        includeLastTrackers: merged.trackerSnapshotCount,
+        role: merged.snapshotRole,
+        header: merged.snapshotHeader,
+    };
+    merged.chatVariableExport.enabled = readBool(merged.chatVariableExport.enabled, true);
+    merged.chatVariableExport.key = sanitizeVariableKey(String(merged.chatVariableExport.key ?? 'tracktor')) || 'tracktor';
+    merged.trackerConnectionId = normalizeNullableString(merged.trackerConnectionId);
+    merged.trackerPresetId = normalizeNullableString(merged.trackerPresetId);
+    merged.savedTrackerPromptId = normalizeNullableString(merged.savedTrackerPromptId);
+    merged.trackerInstructionPrompt = merged.trackerInstructionPrompt || merged.extractionPrompt || DEFAULT_EXTRACTION_PROMPT;
+    merged.extractionPrompt = merged.trackerInstructionPrompt;
+    if (!merged.schemaPresets[merged.activeSchemaPresetKey]) {
+        merged.activeSchemaPresetKey = Object.keys(merged.schemaPresets)[0] ?? 'scene';
+        merged.activeSchemaId = merged.activeSchemaPresetKey;
+    }
+    if (!merged.schemaPresets[merged.activeSchemaPresetKey]) {
+        merged.schemaPresets = structuredClone(defaultSchemaPresets);
+        merged.activeSchemaPresetKey = 'scene';
+        merged.activeSchemaId = 'scene';
+    }
     return merged;
 }
+export function settingsForStorage(settings) {
+    const copy = structuredClone(settings);
+    delete copy.schemaPresets;
+    delete copy.activeSchemaId;
+    delete copy.generationMode;
+    delete copy.sequentialPartGeneration;
+    delete copy.includeLastMessages;
+    delete copy.injection;
+    delete copy.extractionPrompt;
+    return copy;
+}
+export function sanitizeSchemaPresetMap(input) {
+    if (!isPlainObject(input))
+        return structuredClone(defaultSchemaPresets);
+    const out = {};
+    for (const [fallbackKey, value] of Object.entries(input)) {
+        if (!isPlainObject(value))
+            continue;
+        const preset = normalizeSchemaPreset(value, fallbackKey);
+        if (preset)
+            out[preset.key] = preset;
+    }
+    return Object.keys(out).length > 0 ? out : structuredClone(defaultSchemaPresets);
+}
+export function normalizeSchemaPreset(input, fallbackKey = 'schema') {
+    const value = isPlainObject(input) ? input : {};
+    const key = sanitizeId(readString(value.key) || readString(value.id) || fallbackKey) || sanitizeId(fallbackKey) || 'schema';
+    const schema = isPlainObject(value.jsonSchema)
+        ? value.jsonSchema
+        : isPlainObject(value.schema)
+            ? value.schema
+            : DEFAULT_SCHEMA;
+    const template = readString(value.renderTemplate) || readString(value.templateHtml) || DEFAULT_TEMPLATE_HTML;
+    const now = Date.now();
+    return {
+        id: key,
+        key,
+        name: readString(value.name) || key,
+        description: readString(value.description) || undefined,
+        schema: schema,
+        jsonSchema: schema,
+        templateHtml: template,
+        renderTemplate: template,
+        createdAt: sanitizeInteger(value.createdAt, now, 0, Number.MAX_SAFE_INTEGER),
+        updatedAt: sanitizeInteger(value.updatedAt, now, 0, Number.MAX_SAFE_INTEGER),
+    };
+}
 export function getSchemaPreset(settings, preferredId) {
-    const id = preferredId && settings.schemaPresets[preferredId] ? preferredId : settings.activeSchemaId;
-    return settings.schemaPresets[id] ?? settings.schemaPresets[Object.keys(settings.schemaPresets)[0]];
+    const key = preferredId && settings.schemaPresets[preferredId] ? preferredId : settings.activeSchemaPresetKey;
+    return settings.schemaPresets[key] ?? settings.schemaPresets[Object.keys(settings.schemaPresets)[0]];
 }
 export function getTopLevelSchemaKeys(schema) {
     const properties = schema.properties;
@@ -182,9 +344,8 @@ export function getTopLevelSchemaKeys(schema) {
 export function buildTopLevelPartSchema(schema, key) {
     const properties = isPlainObject(schema.properties) ? schema.properties : {};
     const property = properties[key];
-    if (!property) {
+    if (!property)
         throw new Error(`Unknown schema part: ${key}`);
-    }
     return {
         $schema: schema.$schema ?? 'http://json-schema.org/draft-07/schema#',
         title: `${String(schema.title ?? 'Tracker')}Part`,
@@ -204,9 +365,8 @@ export function schemaToExample(schema) {
         case 'object': {
             const out = {};
             const properties = isPlainObject(schema.properties) ? schema.properties : {};
-            for (const [key, value] of Object.entries(properties)) {
+            for (const [key, value] of Object.entries(properties))
                 out[key] = schemaToExample(value);
-            }
             return out;
         }
         case 'array':
@@ -226,8 +386,56 @@ export function renderTrackerTemplate(templateHtml, data) {
     const withoutScripts = stripDangerousHtml(templateHtml);
     return renderScopedTemplate(withoutScripts, data, data);
 }
-export function formatTrackerSnapshot(record, header = 'Tracker') {
-    return `${header}\n\`\`\`json\n${JSON.stringify(record.data, null, 2)}\n\`\`\``;
+export function snapshotToRecord(snapshot, preset) {
+    const schema = preset?.schema ?? preset?.jsonSchema ?? {};
+    const template = snapshot.renderTemplate || preset?.templateHtml || preset?.renderTemplate || '';
+    return {
+        version: VERSION,
+        snapshotId: snapshot.id,
+        schemaId: snapshot.schemaPresetKey,
+        schemaName: preset?.name ?? snapshot.schemaPresetKey,
+        schema,
+        templateHtml: template,
+        data: snapshot.value,
+        renderedHtml: safeRenderTracker(template, snapshot.value),
+        updatedAt: new Date(snapshot.updatedAt).toISOString(),
+        sourceMessageId: snapshot.messageId,
+        pendingRedactions: snapshot.pendingRedactions,
+    };
+}
+export function safeRenderTracker(templateHtml, data) {
+    try {
+        return renderTrackerTemplate(templateHtml, data);
+    }
+    catch {
+        return `<pre>${escapeHtml(JSON.stringify(data, null, 2))}</pre>`;
+    }
+}
+export function formatTrackerSnapshot(record, header = 'Tracker', transform = defaultSnapshotTransformPresets.default_json) {
+    const data = 'value' in record ? record.value : 'data' in record ? record.data : record;
+    let body = formatSnapshotBody(data, transform.input);
+    if (transform.regexPattern) {
+        try {
+            body = body.replace(new RegExp(transform.regexPattern, transform.regexFlags), transform.replacement);
+        }
+        catch {
+            // Keep the base snapshot if a custom regex is invalid.
+        }
+    }
+    const fenced = transform.wrapInCodeFence
+        ? `\`\`\`${transform.codeFenceLang}\n${body}\n\`\`\``
+        : body;
+    return `${header}\n${fenced}`;
+}
+export function formatSnapshotBody(data, input) {
+    if (input === 'top_level_lines' && isPlainObject(data)) {
+        return Object.entries(data)
+            .map(([key, value]) => `${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`)
+            .join('\n');
+    }
+    if (input === 'toon')
+        return toToon(data);
+    return JSON.stringify(data, null, 2);
 }
 export function safePreview(value, max = 160) {
     const compact = value.replace(/\s+/g, ' ').trim();
@@ -257,18 +465,82 @@ export function sanitizeId(value) {
 export function sanitizeVariableKey(value) {
     return value.trim().replace(/[^a-zA-Z0-9_.-]+/g, '_').slice(0, 80);
 }
+export function safeStorageKey(value) {
+    const sanitized = value.replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 120);
+    return sanitized || 'unknown';
+}
 export function chatConfigPath(chatId) {
-    return `chats/${chatId.replace(/[^a-zA-Z0-9_.-]/g, '_')}.json`;
+    return `chats/${safeStorageKey(chatId)}.json`;
+}
+export function snapshotsPath(chatId) {
+    return `snapshots/${safeStorageKey(chatId)}.json`;
+}
+export function jobsPath(chatId) {
+    return `jobs/${safeStorageKey(chatId)}.json`;
 }
 export function isPlainObject(value) {
     return !!value && typeof value === 'object' && !Array.isArray(value);
 }
+function sanitizeSnapshotTransformPresets(input) {
+    const out = {};
+    for (const [key, raw] of Object.entries(input)) {
+        if (!isPlainObject(raw))
+            continue;
+        const presetKey = normalizeEnum(raw.key ?? key, ['default_json', 'minimal', 'toon', 'custom'], 'custom');
+        out[key] = {
+            key: presetKey,
+            name: readString(raw.name) || key,
+            input: normalizeEnum(raw.input, ['pretty_json', 'top_level_lines', 'toon'], 'pretty_json'),
+            regexPattern: readString(raw.regexPattern),
+            regexFlags: readString(raw.regexFlags),
+            replacement: readString(raw.replacement),
+            codeFenceLang: readString(raw.codeFenceLang),
+            wrapInCodeFence: readBool(raw.wrapInCodeFence, presetKey !== 'minimal'),
+        };
+    }
+    return out;
+}
+function normalizeAutoMode(value) {
+    if (value === 'off')
+        return 'none';
+    if (value === 'assistant_message')
+        return 'responses';
+    if (value === 'user_message')
+        return 'inputs';
+    return normalizeEnum(value, ['none', 'responses', 'inputs', 'both'], 'none');
+}
+function normalizeStructuredOutputMode(value) {
+    if (value === 'native_json')
+        return 'native_json_schema';
+    if (value === 'json')
+        return 'json_prompt';
+    return normalizeEnum(value, ['native_json_schema', 'json_prompt', 'xml_prompt', 'toon_prompt'], 'json_prompt');
+}
+function normalizeEnum(value, allowed, fallback) {
+    return typeof value === 'string' && allowed.includes(value) ? value : fallback;
+}
+function normalizeNullableString(value) {
+    if (typeof value !== 'string')
+        return null;
+    const trimmed = value.trim();
+    return trimmed ? trimmed : null;
+}
+function sanitizeStringArray(value) {
+    if (!Array.isArray(value))
+        return [];
+    return value.flatMap((item) => typeof item === 'string' && item.trim() ? [item.trim()] : []);
+}
+function readString(value) {
+    return typeof value === 'string' ? value : '';
+}
+function readBool(value, fallback) {
+    return typeof value === 'boolean' ? value : fallback;
+}
 function assignKnown(target, source, keys) {
     const writable = target;
     for (const key of keys) {
-        if (source[key] !== undefined) {
+        if (source[key] !== undefined)
             writable[key] = source[key];
-        }
     }
 }
 function sanitizeInteger(value, fallback, min, max) {
@@ -326,4 +598,15 @@ function resolveTemplatePath(path, scope, rootData) {
         current = current[part];
     }
     return current ?? '';
+}
+function toToon(data, indent = '') {
+    if (Array.isArray(data)) {
+        return data.map((item, index) => `${indent}${index}: ${isPlainObject(item) || Array.isArray(item) ? `\n${toToon(item, `${indent}  `)}` : String(item)}`).join('\n');
+    }
+    if (isPlainObject(data)) {
+        return Object.entries(data)
+            .map(([key, value]) => `${indent}${key}: ${isPlainObject(value) || Array.isArray(value) ? `\n${toToon(value, `${indent}  `)}` : String(value)}`)
+            .join('\n');
+    }
+    return String(data ?? '');
 }
