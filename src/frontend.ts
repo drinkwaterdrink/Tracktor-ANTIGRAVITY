@@ -74,6 +74,8 @@ const widgetCleanups = new Map<string, () => void>();
 let pinnedHudElement: HTMLElement | null = null;
 let pinnedHudCleanup: (() => void) | null = null;
 let widgetTopObserver: MutationObserver | null = null;
+let floatingFabElement: HTMLElement | null = null;
+let floatingFabCleanup: (() => void) | null = null;
 
 export function setup(ctx: SpindleFrontendContext) {
   ctxRef = ctx;
@@ -124,6 +126,7 @@ export function setup(ctx: SpindleFrontendContext) {
       render();
       renderMessageWidgets();
       renderPinnedHud();
+      renderFloatingFab();
     } else if (payload?.type === 'diagnostic') {
       if (!state) return;
       state.diagnostics = [String(payload.message ?? 'Diagnostic'), ...(state.diagnostics ?? [])].slice(0, 12);
@@ -172,6 +175,7 @@ export function setup(ctx: SpindleFrontendContext) {
     for (const cleanup of widgetCleanups.values()) cleanup();
     widgetCleanups.clear();
     cleanupPinnedHud();
+    cleanupFloatingFab();
     cleanupWidgetTopObserver();
     unbindInputAction?.();
     inputAction?.destroy();
@@ -1413,6 +1417,72 @@ function cleanupPinnedHud(): void {
   }
 }
 
+function renderFloatingFab(): void {
+  const chat = state?.activeChat;
+  if (!chat) {
+    cleanupFloatingFab();
+    return;
+  }
+
+  // Find if there's an active job for tracker generation
+  const activeJob = state?.jobs?.find((j) => j.status === 'running' && j.chatId === chat.id);
+
+  let html = '';
+  if (activeJob) {
+    const progress = activeJob.totalParts ? ` (${activeJob.currentPart}/${activeJob.totalParts})` : '';
+    html = `
+      <div class="tracktor-fab tracktor-fab-busy" data-action="cancel_job" data-job-id="${escapeHtml(activeJob.id)}">
+        <div class="tracktor-fab-spinner">${TRACKTOR_SMALL_ICON}</div>
+        <span>${escapeHtml(activeJob.label)}${progress}</span>
+        <div class="tracktor-fab-stop">${ICON_STOP}</div>
+      </div>
+    `;
+  } else {
+    html = `
+      <div class="tracktor-fab" data-action="generate_tracker">
+        ${TRACKTOR_SMALL_ICON}
+        <span>Generate Tracker</span>
+      </div>
+    `;
+  }
+
+  if (floatingFabElement) {
+    floatingFabElement.innerHTML = html;
+    return;
+  }
+
+  const wrapper = document.createElement('div');
+  wrapper.innerHTML = html;
+  floatingFabElement = wrapper.firstElementChild as HTMLElement;
+  document.body.appendChild(floatingFabElement);
+
+  floatingFabElement.addEventListener('click', (event) => {
+    const button = (event.target as HTMLElement).closest('[data-action]') as HTMLElement | null;
+    if (!button) return;
+    const action = button.dataset.action;
+    if (action === 'generate_tracker') {
+      sendBackend({ type: 'generate_tracker' });
+    } else if (action === 'cancel_job') {
+      sendBackend({ type: 'cancel_job', jobId: button.dataset.jobId });
+    }
+  });
+
+  floatingFabCleanup = () => {
+    floatingFabElement?.remove();
+    floatingFabElement = null;
+    floatingFabCleanup = null;
+  };
+}
+
+function cleanupFloatingFab(): void {
+  if (floatingFabCleanup) {
+    floatingFabCleanup();
+  } else if (floatingFabElement) {
+    floatingFabElement.remove();
+    floatingFabElement = null;
+  }
+}
+
 function buildWidgetHtml(item: TrackerSummary): string {
   const rendered = stripDangerousHtml(item.tracker.renderedHtml);
   return `
@@ -1466,6 +1536,7 @@ const TRACKTOR_SMALL_ICON = '<svg viewBox="0 0 24 24" width="14" height="14" ari
 const ICON_REGENERATE = '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M17.7 6.3A8 8 0 1 0 20 12h-2a6 6 0 1 1-1.76-4.24L13 11h8V3l-3.3 3.3Z"/></svg>';
 const ICON_EDIT = '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M4 17.25V20h2.75L17.8 8.95 15.05 6.2 4 17.25Zm15.7-10.1a1 1 0 0 0 0-1.42l-1.43-1.43a1 1 0 0 0-1.42 0l-1.1 1.1 2.75 2.75 1.2-1Z"/></svg>';
 const ICON_DELETE = '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M7 21a2 2 0 0 1-2-2V7h14v12a2 2 0 0 1-2 2H7ZM9 4h6l1 1h4v2H4V5h4l1-1Zm0 6v8h2v-8H9Zm4 0v8h2v-8h-2Z"/></svg>';
+const ICON_STOP = '<svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M6 6h12v12H6z"/></svg>';
 
 const STYLES = `
   .tracktor-root { height: 100%; overflow: auto; color: var(--lumiverse-text); }
@@ -1717,6 +1788,49 @@ const STYLES = `
     padding-bottom: 0 !important;
     overflow: hidden;
   }
+  .tracktor-fab {
+    position: fixed;
+    right: 16px;
+    bottom: 80px;
+    z-index: 2147483000;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--lumiverse-fill-subtle, #1f1f1f);
+    border: 1px solid var(--lumiverse-border, #444);
+    color: var(--lumiverse-text, #e8e8e8);
+    padding: 8px 14px;
+    border-radius: 20px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    cursor: pointer;
+    font: 650 13px/1.2 system-ui, sans-serif;
+    transition: all 0.2s ease;
+  }
+  .tracktor-fab:hover {
+    border-color: var(--lumiverse-border-hover, #777);
+  }
+  .tracktor-fab-busy {
+    border-color: #e46c6c;
+  }
+  .tracktor-fab-spinner {
+    animation: tracktor-spin 1.5s linear infinite;
+    display: flex;
+  }
+  .tracktor-fab-stop {
+    margin-left: 4px;
+    display: flex;
+    color: #e46c6c;
+    padding: 2px;
+    border-radius: 4px;
+  }
+  .tracktor-fab-stop:hover {
+    background: rgba(228, 108, 108, 0.2);
+  }
+  .tracktor-fab-stop svg {
+    width: 14px;
+    height: 14px;
+  }
+  @keyframes tracktor-spin { 100% { transform: rotate(360deg); } }
   @media (max-width: 680px) {
     .tracktor-toolbar, .tracktor-item-head { flex-direction: column; align-items: stretch; }
     .tracktor-item-head .tracktor-icon-actions { align-self: flex-start; }
