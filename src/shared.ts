@@ -1,6 +1,6 @@
 // Handlebars is the default template engine; the built-in renderer remains as the simple fallback.
 
-import Handlebars from 'handlebars';
+import Handlebars from 'handlebars/dist/handlebars.js';
 
 export const EXTENSION_ID = 'tracktor';
 export const METADATA_KEY = 'tracktor';
