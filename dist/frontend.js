@@ -1833,7 +1833,49 @@ function renderFloatingFab() {
   wrapper.innerHTML = html;
   floatingFabElement = wrapper.firstElementChild;
   document.body.appendChild(floatingFabElement);
+  let isDragging = false;
+  let hasMoved = false;
+  let startX = 0, startY = 0;
+  let initialLeft = 0, initialTop = 0;
+  const onPointerDown = (e) => {
+    isDragging = true;
+    hasMoved = false;
+    startX = e.clientX;
+    startY = e.clientY;
+    const rect = floatingFabElement.getBoundingClientRect();
+    initialLeft = rect.left;
+    initialTop = rect.top;
+    floatingFabElement.setPointerCapture(e.pointerId);
+    floatingFabElement.style.transition = "none";
+  };
+  const onPointerMove = (e) => {
+    if (!isDragging) return;
+    const dx = e.clientX - startX;
+    const dy = e.clientY - startY;
+    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) hasMoved = true;
+    if (hasMoved) {
+      floatingFabElement.style.right = "auto";
+      floatingFabElement.style.bottom = "auto";
+      floatingFabElement.style.left = `${initialLeft + dx}px`;
+      floatingFabElement.style.top = `${initialTop + dy}px`;
+    }
+  };
+  const onPointerUp = (e) => {
+    isDragging = false;
+    floatingFabElement.releasePointerCapture(e.pointerId);
+    floatingFabElement.style.transition = "";
+    if (hasMoved) {
+      localStorage.setItem("tracktor-fab-pos", JSON.stringify({
+        left: floatingFabElement.style.left,
+        top: floatingFabElement.style.top
+      }));
+    }
+  };
+  floatingFabElement.addEventListener("pointerdown", onPointerDown);
+  floatingFabElement.addEventListener("pointermove", onPointerMove);
+  floatingFabElement.addEventListener("pointerup", onPointerUp);
   floatingFabElement.addEventListener("click", (event) => {
+    if (hasMoved) return;
     const button = event.target.closest("[data-action]");
     if (!button) return;
     const action = button.dataset.action;
@@ -1843,6 +1885,17 @@ function renderFloatingFab() {
       sendBackend({ type: "cancel_job", jobId: button.dataset.jobId });
     }
   });
+  const savedPos = localStorage.getItem("tracktor-fab-pos");
+  if (savedPos) {
+    try {
+      const pos = JSON.parse(savedPos);
+      floatingFabElement.style.right = "auto";
+      floatingFabElement.style.bottom = "auto";
+      floatingFabElement.style.left = pos.left;
+      floatingFabElement.style.top = pos.top;
+    } catch {
+    }
+  }
   floatingFabCleanup = () => {
     floatingFabElement?.remove();
     floatingFabElement = null;
@@ -2164,7 +2217,7 @@ var STYLES = `
     position: fixed;
     right: 16px;
     bottom: 80px;
-    z-index: 2147483000;
+    z-index: 90;
     display: flex;
     align-items: center;
     gap: 8px;
