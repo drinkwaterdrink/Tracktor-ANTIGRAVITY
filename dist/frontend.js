@@ -702,10 +702,11 @@ function setup(ctx) {
     if (domToolbarActionElement) {
       const activeJob = state?.jobs?.find((j) => j.status === "running" && j.chatId === state?.activeChat?.id);
       if (activeJob) {
+        const progress = activeJob.totalParts ? ` (${activeJob.currentPart}/${activeJob.totalParts})` : "";
         domToolbarActionElement.classList.add("tracktor-dom-busy");
         domToolbarActionElement.setAttribute("data-action", "cancel_job");
         domToolbarActionElement.setAttribute("data-job-id", activeJob.id);
-        domToolbarActionElement.innerHTML = ICON_STOP;
+        domToolbarActionElement.innerHTML = `${ICON_STOP}<span class="tracktor-dom-progress-text">${escapeHtml(activeJob.label)}${progress}</span>`;
         domToolbarActionElement.title = `Stop ${activeJob.label}`;
       } else {
         domToolbarActionElement.classList.remove("tracktor-dom-busy");
@@ -2143,12 +2144,14 @@ var STYLES = `
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 38px;
+    min-width: 38px;
     height: 38px;
-    border-radius: 50%;
-    padding: 0;
+    border-radius: 20px;
+    padding: 0 9px;
     margin: 0 4px;
     transition: all 0.2s ease;
+    gap: 6px;
+    box-sizing: border-box;
   }
   .tracktor-dom-toolbar-btn:hover {
     background: var(--lumiverse-fill-subtle, rgba(255,255,255,0.1));
@@ -2161,10 +2164,16 @@ var STYLES = `
   .tracktor-dom-toolbar-btn svg {
     width: 20px;
     height: 20px;
+    flex: 0 0 auto;
+  }
+  .tracktor-dom-progress-text {
+    font-size: 13px;
+    font-weight: 600;
+    white-space: nowrap;
   }
   @keyframes tracktor-pulse {
     0% { transform: scale(1); }
-    50% { transform: scale(1.15); }
+    50% { transform: scale(1.05); }
     100% { transform: scale(1); }
   }
   @media (max-width: 680px) {
