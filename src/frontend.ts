@@ -856,7 +856,7 @@ function renderStructuredOutputOptions(value: StructuredOutputMode | undefined, 
 function renderTemplateEngineOptions(value: TemplateEngine | undefined, includeEmpty = false): string {
   const empty = includeEmpty ? `<option value="" ${value ? '' : 'selected'}>Use global template engine</option>` : '';
   return `${empty}
-    <option value="handlebars" ${value === 'handlebars' ? 'selected' : ''}>Handlebars</option>
+    <option value="handlebars" ${value === 'handlebars' ? 'selected' : ''}>Handlebars-compatible</option>
     <option value="simple" ${value === 'simple' ? 'selected' : ''}>Simple fallback</option>
   `;
 }
@@ -1124,7 +1124,7 @@ function openImportPresetModal(): void {
   const modal = ctxRef.ui.showModal({ title: 'Import zTracker/WTracker Preset', width: 760, maxHeight: 760 });
   modal.root.innerHTML = `
     <div class="tracktor-modal-body">
-      <p class="tracktor-muted">Paste a JSON object that contains a schema, HTML/Handlebars template, and extraction prompt.</p>
+      <p class="tracktor-muted">Paste a JSON object that contains a schema, HTML/Handlebars-compatible template, and extraction prompt.</p>
       <textarea class="tracktor-json-editor" spellcheck="false" placeholder='{"name":"My Tracker","schema":{},"templateHtml":"...","trackerInstructionPrompt":"..."}'></textarea>
       <div class="tracktor-actions">
         <button type="button" data-modal-action="import">Import</button>
@@ -1179,7 +1179,7 @@ function readImportedPreset(text: string, settings: TracktorSettings): SchemaPre
   const schema = readFirstObject(candidate, ['jsonSchema', 'schema', 'schemaJson', 'trackerSchema']);
   if (!schema) throw new Error('Imported preset needs a JSON schema object.');
   const templateHtml = readFirstString(candidate, ['templateHtml', 'renderTemplate', 'htmlTemplate', 'trackerHtml', 'html', 'template']);
-  if (!templateHtml) throw new Error('Imported preset needs an HTML/Handlebars template.');
+  if (!templateHtml) throw new Error('Imported preset needs an HTML/Handlebars-compatible template.');
   const trackerInstructionPrompt = readFirstString(candidate, ['trackerInstructionPrompt', 'extractionPrompt', 'trackerPrompt', 'prompt', 'generationPrompt'])
     || DEFAULT_EXTRACTION_PROMPT;
   const systemPrompt = readFirstString(candidate, ['systemPrompt']) || settings.systemPrompt || DEFAULT_SYSTEM_PROMPT;

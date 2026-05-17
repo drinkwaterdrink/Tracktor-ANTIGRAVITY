@@ -11,7 +11,7 @@ Tracktor is a Lumiverse Spindle extension scaffold for flexible, schema-driven c
 - Renders tracker widgets inline on tracked messages using Lumiverse message widgets.
 - Supports prompted JSON, native JSON-schema generation, and XML/TOON prompt fallback modes.
 - Supports sequential top-level part generation for large schemas.
-- Supports real Handlebars tracker templates, including zTracker/WTracker-style `if`, `unless`, nested `each`, and `this.field` usage.
+- Supports Handlebars-compatible tracker templates, including zTracker/WTracker-style `if`, `unless`, nested `each`, and `this.field` usage, without unsafe runtime compilation.
 - Supports top-level section regeneration from saved snapshots.
 - Can inject recent tracker snapshots into normal generations through a Spindle interceptor.
 - Can export the latest tracker to a chat variable such as `{{@tracktor}}`.
@@ -35,7 +35,7 @@ Inside the drawer/settings UI, use **Generate Tracker** to create the current tr
 
 ## zTracker/WTracker Presets
 
-Use **Preset -> Import zTracker/WTracker Preset** to paste a JSON preset containing a schema, Handlebars HTML template, and extraction prompt. Tracktor validates the JSON schema and render-tests the template before saving. Normal `{{...}}` output is escaped by Handlebars, and rendered HTML is sanitized before display. Triple-stash templates are accepted but sanitized after render; normal escaped output is safer.
+Use **Preset -> Import zTracker/WTracker Preset** to paste a JSON preset containing a schema, Handlebars-compatible HTML template, and extraction prompt. Tracktor validates the JSON schema and render-tests the template before saving. Normal `{{...}}` output is escaped, and rendered HTML is sanitized before display. Triple-stash templates are accepted but sanitized after render; normal escaped output is safer.
 
 ## Project Layout
 
@@ -44,7 +44,7 @@ spindle.json
 src/
   backend.ts    # generation, storage, metadata, interceptor
   frontend.ts   # drawer tab, widgets, settings UI
-  shared.ts     # schema defaults, Handlebars/simple renderers, shared types
+  shared.ts     # schema defaults, safe template renderer, shared types
   parser.ts     # JSON extraction and repair
 ```
 

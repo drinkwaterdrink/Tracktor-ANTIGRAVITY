@@ -23,5 +23,5 @@ Tracktor ports the useful zTracker ideas into Lumiverse's Spindle model.
 
 - The stable output path is JSON. XML/TOON prompt fallback settings are preserved, but JSON remains the safest Lumiverse-native baseline.
 - Auto mode runs after rendered user or assistant messages. It does not pause the host reply pipeline the way zTracker's outgoing SillyTavern auto mode can.
-- Template rendering uses real Handlebars by default, with a simple fallback engine kept for compatibility. Rendered HTML is sanitized before display.
+- Template rendering uses a safe interpreted Handlebars-compatible engine because Spindle disables runtime code generation. Rendered HTML is sanitized before display.
 - World-book filtering, character auto-mode exclusion, cleanup flows, array item regeneration, and field-level regeneration are preserved as future zTracker-parity work, not active behavior in this build.

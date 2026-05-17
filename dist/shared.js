@@ -1,5 +1,5 @@
-// Handlebars is the default template engine; the built-in renderer remains as the simple fallback.
-import Handlebars from 'handlebars/dist/handlebars.js';
+// Spindle disables the Function constructor, so Tracktor uses a safe interpreted
+// Handlebars-compatible renderer instead of the official runtime compiler.
 export const EXTENSION_ID = 'tracktor';
 export const METADATA_KEY = 'tracktor';
 export const SETTINGS_PATH = 'settings.json';
@@ -449,11 +449,8 @@ export function schemaToExample(schema) {
 }
 export function renderTrackerTemplate(templateHtml, data, options = {}) {
     const sanitizedTemplate = stripDangerousHtml(templateHtml);
-    const templateEngine = options.templateEngine ?? 'handlebars';
     try {
-        const rendered = templateEngine === 'simple'
-            ? renderBuiltinTemplate(sanitizedTemplate, data, data)
-            : renderHandlebarsTemplate(sanitizedTemplate, data, options.onWarning);
+        const rendered = renderBuiltinTemplate(sanitizedTemplate, data, data);
         return stripDangerousHtml(rendered);
     }
     catch (error) {
@@ -659,44 +656,6 @@ function sanitizeInteger(value, fallback, min, max) {
     if (!Number.isFinite(parsed))
         return fallback;
     return Math.min(max, Math.max(min, Math.floor(parsed)));
-}
-const handlebarsRuntime = createHandlebarsRuntime();
-function createHandlebarsRuntime() {
-    try {
-        const runtime = Handlebars.create();
-        runtime.registerHelper('join', (value, separator) => {
-            if (!Array.isArray(value))
-                return '';
-            const delimiter = typeof separator === 'string' ? separator : ', ';
-            return value.map((item) => {
-                if (item == null)
-                    return '';
-                return typeof item === 'object' ? JSON.stringify(item) : String(item);
-            }).join(delimiter);
-        });
-        runtime.registerHelper('json', (value) => JSON.stringify(value, null, 2));
-        return runtime;
-    }
-    catch {
-        return null;
-    }
-}
-function renderHandlebarsTemplate(template, data, onWarning) {
-    if (!handlebarsRuntime) {
-        onWarning?.('Handlebars runtime was unavailable; falling back to the simple template renderer.');
-        return renderBuiltinTemplate(template, data, data);
-    }
-    const compiled = handlebarsRuntime.compile(template, {
-        noEscape: false,
-        strict: false,
-    });
-    const context = isPlainObject(data)
-        ? { ...data, data }
-        : { data };
-    return compiled(context, {
-        allowProtoMethodsByDefault: false,
-        allowProtoPropertiesByDefault: false,
-    });
 }
 /**
  * Built-in safe template engine that handles the Handlebars subset used by
