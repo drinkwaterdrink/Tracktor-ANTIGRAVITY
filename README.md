@@ -13,6 +13,18 @@ Tracktor is a Lumiverse Spindle extension scaffold for flexible, schema-driven c
 - Can inject recent tracker snapshots into normal generations through a Spindle interceptor.
 - Can export the latest tracker to a chat variable such as `{{@tracktor}}`.
 
+## How To Open It In Lumiverse
+
+After installing and granting permissions, Tracktor appears as a Lumiverse drawer tab:
+
+- Open the sidebar / ViewportDrawer and click **Track**.
+- Or press `Ctrl+K` / `Cmd+K`, type `Tracktor`, and open the tab from the command palette.
+- Or open the chat input bar **Extras** popover and choose **Open Tracktor**.
+
+The drawer tab contains the tracker list, generation buttons, settings, prompt textareas, JSON schema editor, and HTML template editor.
+
+The input bar **Extras** popover also has **Generate Latest Tracker** for quickly generating a tracker for the latest message.
+
 ## Project Layout
 
 ```text

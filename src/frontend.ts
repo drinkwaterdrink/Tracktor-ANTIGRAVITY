@@ -65,9 +65,20 @@ export function setup(ctx: SpindleFrontendContext) {
   root = tab.root;
   root.classList.add('tracktor-root');
 
+  const openAction = ctx.ui.registerInputBarAction?.({
+    id: 'open-tracktor',
+    label: 'Open Tracktor',
+    enabled: true,
+    iconSvg: TRACKTOR_SMALL_ICON,
+  });
+  const unbindOpenAction = openAction?.onClick(() => {
+    tab.activate();
+    ctx.sendToBackend({ type: 'get_state' });
+  });
+
   const inputAction = ctx.ui.registerInputBarAction?.({
     id: 'generate-latest-tracker',
-    label: 'Generate tracker',
+    label: 'Generate Latest Tracker',
     enabled: true,
     iconSvg: TRACKTOR_SMALL_ICON,
   });
@@ -103,6 +114,8 @@ export function setup(ctx: SpindleFrontendContext) {
     widgetCleanups.clear();
     unbindInputAction?.();
     inputAction?.destroy();
+    unbindOpenAction?.();
+    openAction?.destroy();
     unbindActivate();
     unbindBackend();
     tab.destroy();
