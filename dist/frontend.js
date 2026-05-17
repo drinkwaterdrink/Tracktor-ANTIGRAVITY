@@ -641,6 +641,9 @@ var roots = [];
 var ctxRef;
 var lastKnownChatId = null;
 var widgetCleanups = /* @__PURE__ */ new Map();
+var pinnedHudElement = null;
+var pinnedHudCleanup = null;
+var widgetTopObserver = null;
 function setup(ctx) {
   ctxRef = ctx;
   const removeStyle = ctx.dom.addStyle(STYLES);
@@ -685,6 +688,7 @@ function setup(ctx) {
       placement.setBadge(state?.activeChat?.trackers.length ? String(state.activeChat.trackers.length) : null);
       render();
       renderMessageWidgets();
+      renderPinnedHud();
     } else if (payload?.type === "diagnostic") {
       if (!state) return;
       state.diagnostics = [String(payload.message ?? "Diagnostic"), ...state.diagnostics ?? []].slice(0, 12);
@@ -727,6 +731,8 @@ function setup(ctx) {
     roots = [];
     for (const cleanup of widgetCleanups.values()) cleanup();
     widgetCleanups.clear();
+    cleanupPinnedHud();
+    cleanupWidgetTopObserver();
     unbindInputAction?.();
     inputAction?.destroy();
     unbindOpenAction?.();
@@ -1079,8 +1085,8 @@ function renderSettings(settings, current) {
             ${renderTemplateEngineOptions(settings.templateEngine)}
           </select>
         </label>
-        <label>Tracker placement
-          <select data-setting="trackerPlacement">
+        <label>Tracker position
+          <select data-setting="trackerPlacement" data-autosave="settings">
             ${renderTrackerPlacementOptions(settings.trackerPlacement)}
           </select>
         </label>
@@ -1217,9 +1223,9 @@ function renderTemplateEngineOptions(value, includeEmpty = false) {
 }
 function renderTrackerPlacementOptions(value) {
   return `
-    <option value="message_bottom" ${value === "message_bottom" || !value ? "selected" : ""}>Message bottom</option>
-    <option value="message_top" ${value === "message_top" ? "selected" : ""}>Message top</option>
-    <option value="chat_top_pinned" ${value === "chat_top_pinned" ? "selected" : ""}>Chat top (pinned)</option>
+    <option value="message_bottom" ${value === "message_bottom" || !value ? "selected" : ""}>Bottom of message</option>
+    <option value="message_top" ${value === "message_top" ? "selected" : ""}>Top of message</option>
+    <option value="chat_top_pinned" ${value === "chat_top_pinned" ? "selected" : ""}>Pinned at top of chat</option>
   `;
 }
 function formatConnectionLabel(connection) {
@@ -1612,17 +1618,20 @@ function renderMessageWidgets() {
       widgetCleanups.delete(messageId);
     }
   }
+  const placement = state.settings.trackerPlacement ?? "message_bottom";
   for (const tracker of state.activeChat.trackers) {
     const existing = widgetCleanups.get(tracker.messageId);
     if (existing) {
       existing();
       widgetCleanups.delete(tracker.messageId);
     }
+    const widgetPosition = placement === "message_top" ? "top" : void 0;
     const cleanup = ctxRef.messages.renderWidget(
       {
         messageId: tracker.messageId,
         widgetId: "tracktor-tracker",
-        html: buildWidgetHtml(tracker)
+        html: buildWidgetHtml(tracker),
+        ...widgetPosition ? { position: widgetPosition } : {}
       },
       (message) => {
         if (message?.type === "regenerate") {
@@ -1635,6 +1644,156 @@ function renderMessageWidgets() {
       }
     );
     widgetCleanups.set(tracker.messageId, cleanup);
+  }
+  if (placement === "message_top") {
+    scheduleWidgetTopRelocation();
+  } else {
+    cleanupWidgetTopObserver();
+  }
+}
+function scheduleWidgetTopRelocation() {
+  cleanupWidgetTopObserver();
+  relocateWidgetsToTop();
+  try {
+    widgetTopObserver = new MutationObserver(() => {
+      relocateWidgetsToTop();
+    });
+    widgetTopObserver.observe(document.body, { childList: true, subtree: true });
+  } catch {
+  }
+}
+function relocateWidgetsToTop() {
+  if (!state?.activeChat) return;
+  let relocated = false;
+  for (const tracker of state.activeChat.trackers) {
+    const selectors = [
+      `[data-message-id="${tracker.messageId}"] [data-widget-id="tracktor-tracker"]`,
+      `[data-message-id="${tracker.messageId}"] .spindle-widget-tracktor-tracker`,
+      `[data-message-id="${tracker.messageId}"] iframe[data-widget="tracktor-tracker"]`
+    ];
+    for (const selector of selectors) {
+      try {
+        const widget = document.querySelector(selector);
+        if (!widget) continue;
+        const messageContainer = widget.closest(`[data-message-id="${tracker.messageId}"]`);
+        if (!messageContainer) continue;
+        const firstChild = messageContainer.firstElementChild;
+        if (firstChild && firstChild !== widget && widget.parentElement === messageContainer) {
+          messageContainer.insertBefore(widget, firstChild);
+          relocated = true;
+        }
+        break;
+      } catch {
+      }
+    }
+  }
+  if (!relocated && state.activeChat.trackers.length > 0) {
+  }
+}
+function cleanupWidgetTopObserver() {
+  if (widgetTopObserver) {
+    widgetTopObserver.disconnect();
+    widgetTopObserver = null;
+  }
+}
+function renderPinnedHud() {
+  const placement = state?.settings.trackerPlacement ?? "message_bottom";
+  if (placement !== "chat_top_pinned") {
+    cleanupPinnedHud();
+    return;
+  }
+  const trackers = state?.activeChat?.trackers ?? [];
+  if (trackers.length === 0) {
+    cleanupPinnedHud();
+    return;
+  }
+  const latest = trackers[trackers.length - 1];
+  const renderedContent = stripDangerousHtml(latest.tracker.renderedHtml);
+  const hudHtml = `
+    <div class="tracktor-pinned-hud" data-tracktor-pinned-hud>
+      <div class="tracktor-pinned-bar">
+        <button type="button" class="tracktor-pinned-toggle" title="Toggle tracker" aria-label="Toggle tracker">
+          ${TRACKTOR_SMALL_ICON}
+          <strong>${escapeHtml(latest.tracker.schemaName)}</strong>
+          <span class="tracktor-pinned-meta">${escapeHtml(safePreview(latest.messagePreview, 50))}</span>
+        </button>
+        <div class="tracktor-actions tracktor-icon-actions">
+          ${renderIconButton("regenerate", ICON_REGENERATE, "Regenerate tracker", { chatId: latest.chatId, messageId: latest.messageId })}
+          ${renderIconButton("edit", ICON_EDIT, "Edit tracker JSON", { chatId: latest.chatId, messageId: latest.messageId })}
+          ${renderIconButton("delete", ICON_DELETE, "Delete tracker", { chatId: latest.chatId, messageId: latest.messageId })}
+        </div>
+      </div>
+      <div class="tracktor-pinned-body tracktor-rendered">
+        ${renderedContent}
+      </div>
+    </div>
+  `;
+  if (pinnedHudElement) {
+    pinnedHudElement.innerHTML = hudHtml;
+    attachPinnedHudHandlers(pinnedHudElement, latest);
+    return;
+  }
+  const chatMountTargets = [
+    ".chat-messages",
+    ".message-list",
+    "[data-chat-messages]",
+    "#chat-messages",
+    "main"
+  ];
+  let mountTarget = null;
+  for (const selector of chatMountTargets) {
+    mountTarget = document.querySelector(selector);
+    if (mountTarget) break;
+  }
+  const wrapper = document.createElement("div");
+  wrapper.classList.add("tracktor-pinned-wrapper");
+  wrapper.innerHTML = hudHtml;
+  if (mountTarget && typeof ctxRef.dom.inject === "function") {
+    try {
+      pinnedHudElement = ctxRef.dom.inject(mountTarget, wrapper.innerHTML, "afterbegin");
+    } catch {
+      pinnedHudElement = null;
+    }
+  }
+  if (!pinnedHudElement) {
+    wrapper.classList.add("tracktor-pinned-fixed");
+    document.body.appendChild(wrapper);
+    pinnedHudElement = wrapper;
+  }
+  attachPinnedHudHandlers(pinnedHudElement, latest);
+  pinnedHudCleanup = () => {
+    pinnedHudElement?.remove();
+    pinnedHudElement = null;
+    pinnedHudCleanup = null;
+  };
+}
+function attachPinnedHudHandlers(container, tracker) {
+  const toggle = container.querySelector(".tracktor-pinned-toggle");
+  const body = container.querySelector(".tracktor-pinned-body");
+  if (toggle && body) {
+    toggle.addEventListener("click", () => {
+      body.classList.toggle("tracktor-pinned-collapsed");
+    });
+  }
+  container.addEventListener("click", (event) => {
+    const button = event.target?.closest("[data-action]");
+    if (!button) return;
+    const action = button.dataset.action;
+    if (action === "regenerate") {
+      sendBackend({ type: "regenerate_tracker", chatId: tracker.chatId, messageId: tracker.messageId });
+    } else if (action === "edit") {
+      openEditModal(tracker.chatId, tracker.messageId);
+    } else if (action === "delete") {
+      void confirmDelete(tracker.chatId, tracker.messageId);
+    }
+  });
+}
+function cleanupPinnedHud() {
+  if (pinnedHudCleanup) {
+    pinnedHudCleanup();
+  } else if (pinnedHudElement) {
+    pinnedHudElement.remove();
+    pinnedHudElement = null;
   }
 }
 function buildWidgetHtml(item) {
@@ -1876,10 +2035,75 @@ var STYLES = `
   .tracktor-diagnostics p { margin: 6px 0 0; color: var(--lumiverse-text-muted); }
   .tracktor-modal-body { display: flex; flex-direction: column; gap: 8px; }
   .tracktor-json-editor { min-height: 420px; width: 100%; box-sizing: border-box; font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .tracktor-pinned-wrapper {
+    position: relative;
+    z-index: 100;
+  }
+  .tracktor-pinned-fixed {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 2147483000;
+    pointer-events: auto;
+  }
+  .tracktor-pinned-hud {
+    border: 1px solid var(--lumiverse-border, #444);
+    background: var(--lumiverse-fill-subtle, #1a1a1a);
+    color: var(--lumiverse-text, #e8e8e8);
+    border-radius: 0 0 10px 10px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, .3);
+    font: 12px/1.45 system-ui, sans-serif;
+    overflow: hidden;
+  }
+  .tracktor-pinned-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--lumiverse-border, #444);
+  }
+  .tracktor-pinned-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border: none;
+    background: none;
+    color: inherit;
+    cursor: pointer;
+    padding: 0;
+    font: inherit;
+    min-width: 0;
+  }
+  .tracktor-pinned-toggle:hover { opacity: .8; }
+  .tracktor-pinned-toggle strong { font-weight: 650; white-space: nowrap; }
+  .tracktor-pinned-meta {
+    color: var(--lumiverse-text-muted, #aaa);
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 180px;
+  }
+  .tracktor-pinned-body {
+    padding: 8px 10px;
+    max-height: 240px;
+    overflow: auto;
+    transition: max-height .2s ease, padding .2s ease;
+  }
+  .tracktor-pinned-collapsed {
+    max-height: 0 !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+    overflow: hidden;
+  }
   @media (max-width: 680px) {
     .tracktor-toolbar, .tracktor-item-head { flex-direction: column; align-items: stretch; }
     .tracktor-item-head .tracktor-icon-actions { align-self: flex-start; }
     .tracktor-form-grid, .tracktor-grid { grid-template-columns: 1fr; }
+    .tracktor-pinned-meta { max-width: 100px; }
+    .tracktor-pinned-body { max-height: 180px; }
   }
 `;
 export {
