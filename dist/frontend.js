@@ -644,8 +644,6 @@ var widgetCleanups = /* @__PURE__ */ new Map();
 var pinnedHudElement = null;
 var pinnedHudCleanup = null;
 var widgetTopObserver = null;
-var floatingFabElement = null;
-var floatingFabCleanup = null;
 function setup(ctx) {
   ctxRef = ctx;
   const removeStyle = ctx.dom.addStyle(STYLES);
@@ -664,16 +662,6 @@ function setup(ctx) {
     placement.activate();
     sendBackend({ type: "refresh_state" });
   });
-  const inputAction = ctx.ui?.registerInputBarAction?.({
-    id: "generate-latest-tracker",
-    label: "Generate Latest Tracker",
-    enabled: true,
-    iconSvg: TRACKTOR_SMALL_ICON
-  });
-  const unbindInputAction = inputAction?.onClick(() => {
-    sendBackend({ type: "generate_tracker" });
-    placement.activate();
-  });
   const toggleInjectionAction = ctx.ui?.registerInputBarAction?.({
     id: "toggle-tracktor-injection",
     label: "Toggle Tracker Injection",
@@ -683,6 +671,40 @@ function setup(ctx) {
   const unbindToggleInjectionAction = toggleInjectionAction?.onClick(() => {
     sendBackend({ type: "toggle_injection" });
   });
+  let toolbarAction = null;
+  let unbindToolbarAction = null;
+  const renderToolbarAction = () => {
+    if (toolbarAction) {
+      unbindToolbarAction?.();
+      toolbarAction.destroy?.();
+      toolbarAction = null;
+      unbindToolbarAction = null;
+    }
+    const activeJob = state?.jobs?.find((j) => j.status === "running" && j.chatId === state?.activeChat?.id);
+    if (activeJob) {
+      const progress = activeJob.totalParts ? ` (${activeJob.currentPart}/${activeJob.totalParts})` : "";
+      toolbarAction = ctxRef.ui?.registerInputBarAction?.({
+        id: "tracktor-generate-action",
+        label: `Stop ${activeJob.label}${progress}`,
+        enabled: true,
+        iconSvg: ICON_STOP
+      });
+      unbindToolbarAction = toolbarAction?.onClick(() => {
+        sendBackend({ type: "cancel_job", jobId: activeJob.id });
+      });
+    } else {
+      toolbarAction = ctxRef.ui?.registerInputBarAction?.({
+        id: "tracktor-generate-action",
+        label: "Generate Latest Tracker",
+        enabled: true,
+        iconSvg: TRACKTOR_SMALL_ICON
+      });
+      unbindToolbarAction = toolbarAction?.onClick(() => {
+        sendBackend({ type: "generate_tracker" });
+        placement.activate();
+      });
+    }
+  };
   const unbindBackend = ctx.onBackendMessage((payload) => {
     if (payload?.type === "state") {
       state = payload.state;
@@ -691,7 +713,7 @@ function setup(ctx) {
       render();
       renderMessageWidgets();
       renderPinnedHud();
-      renderFloatingFab();
+      renderToolbarAction();
     } else if (payload?.type === "diagnostic") {
       if (!state) return;
       state.diagnostics = [String(payload.message ?? "Diagnostic"), ...state.diagnostics ?? []].slice(0, 12);
@@ -735,10 +757,9 @@ function setup(ctx) {
     for (const cleanup of widgetCleanups.values()) cleanup();
     widgetCleanups.clear();
     cleanupPinnedHud();
-    cleanupFloatingFab();
     cleanupWidgetTopObserver();
-    unbindInputAction?.();
-    inputAction?.destroy();
+    unbindToolbarAction?.();
+    toolbarAction?.destroy?.();
     unbindOpenAction?.();
     openAction?.destroy();
     unbindToggleInjectionAction?.();
@@ -1800,116 +1821,6 @@ function cleanupPinnedHud() {
     pinnedHudElement = null;
   }
 }
-function renderFloatingFab() {
-  const chat = state?.activeChat;
-  if (!chat) {
-    cleanupFloatingFab();
-    return;
-  }
-  const activeJob = state?.jobs?.find((j) => j.status === "running" && j.chatId === chat.id);
-  let html = "";
-  if (activeJob) {
-    const progress = activeJob.totalParts ? ` (${activeJob.currentPart}/${activeJob.totalParts})` : "";
-    html = `
-      <div class="tracktor-fab tracktor-fab-busy" data-action="cancel_job" data-job-id="${escapeHtml(activeJob.id)}">
-        <div class="tracktor-fab-spinner">${TRACKTOR_SMALL_ICON}</div>
-        <span>${escapeHtml(activeJob.label)}${progress}</span>
-        <div class="tracktor-fab-stop">${ICON_STOP}</div>
-      </div>
-    `;
-  } else {
-    html = `
-      <div class="tracktor-fab" data-action="generate_tracker">
-        ${TRACKTOR_SMALL_ICON}
-        <span>Generate Tracker</span>
-      </div>
-    `;
-  }
-  if (floatingFabElement) {
-    floatingFabElement.innerHTML = html;
-    return;
-  }
-  const wrapper = document.createElement("div");
-  wrapper.innerHTML = html;
-  floatingFabElement = wrapper.firstElementChild;
-  document.body.appendChild(floatingFabElement);
-  let isDragging = false;
-  let hasMoved = false;
-  let startX = 0, startY = 0;
-  let initialLeft = 0, initialTop = 0;
-  const onPointerDown = (e) => {
-    isDragging = true;
-    hasMoved = false;
-    startX = e.clientX;
-    startY = e.clientY;
-    const rect = floatingFabElement.getBoundingClientRect();
-    initialLeft = rect.left;
-    initialTop = rect.top;
-    floatingFabElement.setPointerCapture(e.pointerId);
-    floatingFabElement.style.transition = "none";
-  };
-  const onPointerMove = (e) => {
-    if (!isDragging) return;
-    const dx = e.clientX - startX;
-    const dy = e.clientY - startY;
-    if (Math.abs(dx) > 3 || Math.abs(dy) > 3) hasMoved = true;
-    if (hasMoved) {
-      floatingFabElement.style.right = "auto";
-      floatingFabElement.style.bottom = "auto";
-      floatingFabElement.style.left = `${initialLeft + dx}px`;
-      floatingFabElement.style.top = `${initialTop + dy}px`;
-    }
-  };
-  const onPointerUp = (e) => {
-    isDragging = false;
-    floatingFabElement.releasePointerCapture(e.pointerId);
-    floatingFabElement.style.transition = "";
-    if (hasMoved) {
-      localStorage.setItem("tracktor-fab-pos", JSON.stringify({
-        left: floatingFabElement.style.left,
-        top: floatingFabElement.style.top
-      }));
-    }
-  };
-  floatingFabElement.addEventListener("pointerdown", onPointerDown);
-  floatingFabElement.addEventListener("pointermove", onPointerMove);
-  floatingFabElement.addEventListener("pointerup", onPointerUp);
-  floatingFabElement.addEventListener("click", (event) => {
-    if (hasMoved) return;
-    const button = event.target.closest("[data-action]");
-    if (!button) return;
-    const action = button.dataset.action;
-    if (action === "generate_tracker") {
-      sendBackend({ type: "generate_tracker" });
-    } else if (action === "cancel_job") {
-      sendBackend({ type: "cancel_job", jobId: button.dataset.jobId });
-    }
-  });
-  const savedPos = localStorage.getItem("tracktor-fab-pos");
-  if (savedPos) {
-    try {
-      const pos = JSON.parse(savedPos);
-      floatingFabElement.style.right = "auto";
-      floatingFabElement.style.bottom = "auto";
-      floatingFabElement.style.left = pos.left;
-      floatingFabElement.style.top = pos.top;
-    } catch {
-    }
-  }
-  floatingFabCleanup = () => {
-    floatingFabElement?.remove();
-    floatingFabElement = null;
-    floatingFabCleanup = null;
-  };
-}
-function cleanupFloatingFab() {
-  if (floatingFabCleanup) {
-    floatingFabCleanup();
-  } else if (floatingFabElement) {
-    floatingFabElement.remove();
-    floatingFabElement = null;
-  }
-}
 function buildWidgetHtml(item) {
   const rendered = stripDangerousHtml(item.tracker.renderedHtml);
   return `
@@ -2213,49 +2124,6 @@ var STYLES = `
     padding-bottom: 0 !important;
     overflow: hidden;
   }
-  .tracktor-fab {
-    position: fixed;
-    right: 16px;
-    bottom: 80px;
-    z-index: 90;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    background: var(--lumiverse-fill-subtle, #1f1f1f);
-    border: 1px solid var(--lumiverse-border, #444);
-    color: var(--lumiverse-text, #e8e8e8);
-    padding: 8px 14px;
-    border-radius: 20px;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
-    cursor: pointer;
-    font: 650 13px/1.2 system-ui, sans-serif;
-    transition: all 0.2s ease;
-  }
-  .tracktor-fab:hover {
-    border-color: var(--lumiverse-border-hover, #777);
-  }
-  .tracktor-fab-busy {
-    border-color: #e46c6c;
-  }
-  .tracktor-fab-spinner {
-    animation: tracktor-spin 1.5s linear infinite;
-    display: flex;
-  }
-  .tracktor-fab-stop {
-    margin-left: 4px;
-    display: flex;
-    color: #e46c6c;
-    padding: 2px;
-    border-radius: 4px;
-  }
-  .tracktor-fab-stop:hover {
-    background: rgba(228, 108, 108, 0.2);
-  }
-  .tracktor-fab-stop svg {
-    width: 14px;
-    height: 14px;
-  }
-  @keyframes tracktor-spin { 100% { transform: rotate(360deg); } }
   @media (max-width: 680px) {
     .tracktor-toolbar, .tracktor-item-head { flex-direction: column; align-items: stretch; }
     .tracktor-item-head .tracktor-icon-actions { align-self: flex-start; }
