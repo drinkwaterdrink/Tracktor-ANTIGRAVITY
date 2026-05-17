@@ -686,20 +686,26 @@ function setup(ctx) {
   let domToolbarActionObserver = null;
   const injectToolbarAction = () => {
     if (domToolbarActionElement && document.body.contains(domToolbarActionElement)) return;
-    const sendButton = document.querySelector('button[aria-label*="Send" i], button[title*="Send" i], button[type="submit"], [data-testid*="send" i], button svg path[d*="M2"]')?.closest("button");
-    if (sendButton && sendButton.parentElement) {
-      const btn = document.createElement("button");
-      btn.className = "tracktor-dom-toolbar-btn";
-      btn.type = "button";
-      btn.addEventListener("click", (event) => {
-        const action = btn.getAttribute("data-action");
-        if (action === "generate_tracker") {
-          sendBackend({ type: "generate_tracker" });
-        } else if (action === "cancel_job") {
-          sendBackend({ type: "cancel_job", jobId: btn.getAttribute("data-job-id") ?? void 0 });
-        }
-      });
+    const btn = document.createElement("button");
+    btn.className = "tracktor-dom-toolbar-btn";
+    btn.type = "button";
+    btn.addEventListener("click", () => {
+      const action = btn.getAttribute("data-action");
+      if (action === "generate_tracker") {
+        sendBackend({ type: "generate_tracker" });
+      } else if (action === "cancel_job") {
+        sendBackend({ type: "cancel_job", jobId: btn.getAttribute("data-job-id") ?? void 0 });
+      }
+    });
+    const sendButton = findSendButton();
+    if (sendButton?.parentElement) {
       sendButton.parentElement.insertBefore(btn, sendButton);
+      domToolbarActionElement = btn;
+      return;
+    }
+    const toolbar = findChatToolbarMount();
+    if (toolbar) {
+      toolbar.appendChild(btn);
       domToolbarActionElement = btn;
     }
   };
@@ -722,11 +728,14 @@ function setup(ctx) {
         domToolbarActionElement.classList.remove("tracktor-dom-busy");
         domToolbarActionElement.setAttribute("data-action", "generate_tracker");
         domToolbarActionElement.removeAttribute("data-job-id");
-        domToolbarActionElement.innerHTML = TRACKTOR_SMALL_ICON;
+        domToolbarActionElement.innerHTML = `${TRACKTOR_SMALL_ICON}<span class="tracktor-dom-label">Tracktor</span>`;
         domToolbarActionElement.title = "Generate Latest Tracker";
+        domToolbarActionElement.setAttribute("aria-label", "Generate latest Tracktor tracker");
       }
     }
   };
+  renderDomToolbarAction();
+  setTimeout(renderDomToolbarAction, 500);
   const unbindBackend = ctx.onBackendMessage((payload) => {
     if (payload?.type === "state") {
       state = payload.state;
@@ -845,6 +854,39 @@ function readChatId(payload) {
     if (typeof nested.chat_id === "string") return nested.chat_id;
   }
   return void 0;
+}
+function findSendButton() {
+  const selectors = [
+    'button[aria-label*="Send" i]',
+    'button[title*="Send" i]',
+    'button[data-testid*="send" i]',
+    'button[type="submit"]',
+    '[data-testid*="send" i]'
+  ];
+  for (const selector of selectors) {
+    const found = document.querySelector(selector);
+    const button = found?.closest("button");
+    if (button && !button.classList.contains("tracktor-dom-toolbar-btn")) return button;
+  }
+  const sendPath = document.querySelector('button svg path[d*="M2"]');
+  return sendPath?.closest("button");
+}
+function findChatToolbarMount() {
+  const selectors = [
+    "[data-input-actions]",
+    "[data-chat-input-actions]",
+    "[data-composer-actions]",
+    ".chat-input-actions",
+    ".composer-actions",
+    ".input-actions",
+    ".message-input-actions",
+    "form"
+  ];
+  for (const selector of selectors) {
+    const found = document.querySelector(selector);
+    if (found) return found;
+  }
+  return null;
 }
 function tryCreateDrawerTab(ctx) {
   if (typeof ctx.ui?.registerDrawerTab !== "function") {
@@ -1932,7 +1974,7 @@ function renderMessageWidgets() {
     const cleanup = ctxRef.messages.renderWidget(
       {
         messageId: tracker.messageId,
-        widgetId: "tracktor-tracker",
+        widgetId: tracktorWidgetId(tracker.messageId),
         html: buildWidgetHtml(tracker),
         ...widgetPosition ? { position: widgetPosition } : {}
       },
@@ -1947,6 +1989,9 @@ function renderMessageWidgets() {
       }
     );
     widgetCleanups.set(tracker.messageId, cleanup);
+    if (placement === "message_top") {
+      scheduleSingleWidgetTopRelocation(tracker.messageId);
+    }
   }
   if (placement === "message_top") {
     scheduleWidgetTopRelocation();
@@ -1957,6 +2002,9 @@ function renderMessageWidgets() {
 function scheduleWidgetTopRelocation() {
   cleanupWidgetTopObserver();
   relocateWidgetsToTop();
+  setTimeout(relocateWidgetsToTop, 100);
+  setTimeout(relocateWidgetsToTop, 400);
+  setTimeout(relocateWidgetsToTop, 1e3);
   try {
     widgetTopObserver = new MutationObserver(() => {
       relocateWidgetsToTop();
@@ -1967,23 +2015,77 @@ function scheduleWidgetTopRelocation() {
 }
 function relocateWidgetsToTop() {
   if (!state?.activeChat) return;
-  const widgets = Array.from(document.querySelectorAll('iframe, [data-widget-id], [class*="widget"]'));
-  for (const widget of widgets) {
-    const isTracktor = widget.getAttribute("data-widget-id")?.includes("tracktor") || widget.getAttribute("name")?.includes("tracktor") || widget.getAttribute("src")?.includes("tracktor") || widget.className.includes("tracktor");
-    if (!isTracktor) continue;
-    const widgetWrapper = widget.closest(".spindle-widget, .widget-container, [data-widget-wrapper]") || widget;
-    const messageContainer = widgetWrapper.closest('.message, [data-message-id], .chat-message, [class*="message"]');
-    if (messageContainer) {
-      if (messageContainer.firstElementChild && messageContainer.firstElementChild !== widgetWrapper) {
-        messageContainer.insertBefore(widgetWrapper, messageContainer.firstElementChild);
-      }
-    } else {
-      const grandParent = widgetWrapper.parentElement;
-      if (grandParent && grandParent.firstElementChild && grandParent.firstElementChild !== widgetWrapper) {
-        grandParent.insertBefore(widgetWrapper, grandParent.firstElementChild);
-      }
-    }
+  for (const tracker of state.activeChat.trackers) moveTrackerWidgetToTop(tracker.messageId);
+}
+function scheduleSingleWidgetTopRelocation(messageId) {
+  moveTrackerWidgetToTop(messageId);
+  setTimeout(() => moveTrackerWidgetToTop(messageId), 100);
+  setTimeout(() => moveTrackerWidgetToTop(messageId), 400);
+  setTimeout(() => moveTrackerWidgetToTop(messageId), 1e3);
+}
+function moveTrackerWidgetToTop(messageId) {
+  const messageContainer = findMessageContainer(messageId);
+  if (!messageContainer) return;
+  const widgetWrapper = findTracktorWidgetWrapper(messageContainer, messageId);
+  if (!widgetWrapper) return;
+  const content = findMessageContentElement(messageContainer);
+  if (content && content.contains(widgetWrapper)) {
+    const first2 = content.firstElementChild;
+    if (first2 && first2 !== widgetWrapper) content.insertBefore(widgetWrapper, first2);
+    return;
   }
+  if (content && content !== widgetWrapper && content.parentElement === messageContainer) {
+    messageContainer.insertBefore(widgetWrapper, content);
+    return;
+  }
+  const first = messageContainer.firstElementChild;
+  if (first && first !== widgetWrapper) messageContainer.insertBefore(widgetWrapper, first);
+}
+function findMessageContainer(messageId) {
+  const escaped = cssEscape(messageId);
+  const selectors = [
+    `[data-message-id="${escaped}"]`,
+    `[data-message_id="${escaped}"]`,
+    `[data-id="${escaped}"]`,
+    `[id="${escaped}"]`
+  ];
+  for (const selector of selectors) {
+    const found = document.querySelector(selector);
+    if (found) return found.closest('.message, .chat-message, [data-message-id], [class*="message"]') ?? found;
+  }
+  const allMessages = Array.from(document.querySelectorAll('.message, .chat-message, [data-message-id], [class*="message"]'));
+  return allMessages.find((element) => element.outerHTML.includes(messageId)) ?? null;
+}
+function findTracktorWidgetWrapper(messageContainer, messageId) {
+  const widgetId = tracktorWidgetId(messageId);
+  const selectors = [
+    `[data-widget-id*="${cssEscape(widgetId)}"]`,
+    `[data-widget-id*="tracktor"]`,
+    `[data-widget-key*="tracktor"]`,
+    `[data-spindle-widget*="tracktor"]`,
+    `iframe[name*="tracktor"]`,
+    `iframe[src*="tracktor"]`,
+    ".tracktor-widget-host",
+    ".spindle-widget",
+    ".widget-container",
+    "[data-widget-wrapper]",
+    "iframe"
+  ];
+  for (const selector of selectors) {
+    const candidate = messageContainer.querySelector(selector);
+    if (!candidate) continue;
+    return candidate.closest(".spindle-widget, .widget-container, [data-widget-wrapper]") ?? candidate;
+  }
+  return null;
+}
+function findMessageContentElement(messageContainer) {
+  return messageContainer.querySelector('.message-content, .chat-message-content, [data-message-content], [class*="content"]');
+}
+function tracktorWidgetId(messageId) {
+  return `tracktor-tracker-${sanitizeId(messageId) || "message"}`;
+}
+function cssEscape(value) {
+  return globalThis.CSS?.escape?.(value) ?? value.replace(/["\\]/g, "\\$&");
 }
 function cleanupWidgetTopObserver() {
   if (widgetTopObserver) {
@@ -2099,8 +2201,8 @@ function buildWidgetHtml(item) {
       button { border: 1px solid var(--lumiverse-border, #444); background: var(--lumiverse-fill, #111); color: inherit; border-radius: 7px; cursor: pointer; }
       button:hover, button:focus-visible { border-color: var(--lumiverse-border-hover, #777); outline: none; }
       .actions { display: flex; gap: 5px; flex-wrap: nowrap; align-items: center; }
-      .icon-button { width: 30px; height: 30px; padding: 0; display: inline-grid; place-items: center; flex: 0 0 auto; border-radius: 6px; }
-      .icon-button svg { width: 15px; height: 15px; display: block; }
+      .icon-button { width: 16px; height: 16px; padding: 0; display: inline-grid; place-items: center; flex: 0 0 auto; border-radius: 4px; }
+      .icon-button svg { width: 8px; height: 8px; display: block; }
       table { width: 100%; border-collapse: collapse; }
       td { border-top: 1px solid var(--lumiverse-border, #444); padding: 4px 6px; vertical-align: top; }
       details { margin-top: 8px; }
@@ -2269,15 +2371,15 @@ var STYLES = `
   .tracktor-primary-actions { margin-top: 8px; }
   .tracktor-icon-actions { flex-wrap: nowrap; }
   .tracktor-icon-button {
-    width: 30px;
-    height: 30px;
+    width: 16px;
+    height: 16px;
     padding: 0 !important;
     display: inline-grid;
     place-items: center;
     flex: 0 0 auto;
-    border-radius: 6px !important;
+    border-radius: 4px !important;
   }
-  .tracktor-icon-button svg { width: 15px; height: 15px; display: block; }
+  .tracktor-icon-button svg { width: 8px; height: 8px; display: block; }
   .tracktor-icon-button:focus-visible { outline: 2px solid var(--lumiverse-accent); outline-offset: 2px; }
   .tracktor-form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   .tracktor-common-controls { align-items: end; }
@@ -2410,17 +2512,17 @@ var STYLES = `
     overflow: hidden;
   }
   .tracktor-dom-toolbar-btn {
-    background: transparent;
-    border: none;
-    color: var(--lumiverse-text-muted, #aaa);
+    background: var(--lumiverse-fill-subtle, rgba(255,255,255,0.08));
+    border: 1px solid var(--lumiverse-border, rgba(255,255,255,0.14));
+    color: var(--lumiverse-text, #fff);
     cursor: pointer;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    min-width: 38px;
+    min-width: 0;
     height: 38px;
     border-radius: 20px;
-    padding: 0 9px;
+    padding: 0 12px;
     margin: 0 4px;
     transition: all 0.2s ease;
     gap: 6px;
@@ -2435,9 +2537,14 @@ var STYLES = `
     animation: tracktor-pulse 1.5s infinite;
   }
   .tracktor-dom-toolbar-btn svg {
-    width: 20px;
-    height: 20px;
+    width: 16px;
+    height: 16px;
     flex: 0 0 auto;
+  }
+  .tracktor-dom-label {
+    font-size: 13px;
+    font-weight: 650;
+    white-space: nowrap;
   }
   .tracktor-dom-progress-text {
     font-size: 13px;
